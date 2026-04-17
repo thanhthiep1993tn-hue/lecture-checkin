@@ -8,49 +8,41 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from flask import Flask, jsonify, redirect, render_template_string, request, send_file, url_for
-from urllib.parse import quote_plus
+from flask import (
+    Flask,
+    jsonify,
+    redirect,
+    render_template_string,
+    request,
+    send_file,
+    url_for,
+)
 
 # ============================================================
-# 讲座签到系统（微信小程序式前台 + 后台管理界面，单文件版）
-# ============================================================
-# 说明：
-# 1. 这不是原生微信小程序代码，而是“微信小程序风格”的移动端 H5 前台。
-# 2. 优点是部署更快：生成二维码后，参会者扫码即可进入签到页。
-# 3. 后台为 Web 管理界面，可上传名单、查看记录、导出结果。
-# 4. 若你后续确定要原生微信小程序，我可以在此基础上继续拆成：
-#    - 微信小程序前端（pages / app.json / app.js）
-#    - Flask / FastAPI 后端 API
-#
-# 运行方式：
-#   pip install flask pandas openpyxl
-#   python app.py
-#
-# 打开：
-#   http://127.0.0.1:5000/admin
-#
-# 签到二维码示例：
-#   http://127.0.0.1:5000/m/checkin?event_id=lecture_001
+# 讲座签到系统（标准单文件版）
+# 适用：
+# 1. 本地开发
+# 2. Render / Gunicorn 部署
 # ============================================================
 
-# 兼容不同运行环境（如 Jupyter / 在线IDE 没有 __file__）
+# -----------------------------
+# 路径与应用
+# -----------------------------
 try:
     BASE_DIR = Path(__file__).resolve().parent
 except NameError:
     BASE_DIR = Path.cwd()
+
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "checkin_mini.db"
 
 app = Flask(__name__)
-app.secret_key = "replace-this-with-random-secret"
-
-with app.app_context():
-    init_db()
+app.secret_key = "replace-this-with-a-random-secret-key"
 
 
 # -----------------------------
-# DB
+# 数据库
 # -----------------------------
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -78,10 +70,10 @@ def init_db() -> None:
         """
     )
 
-    # 兼容旧库：如果 source 列不存在，则补上
+    # 兼容旧表：若没有 source 字段，则补上
     cur.execute("PRAGMA table_info(registrants)")
-    registrant_cols = [row[1] for row in cur.fetchall()]
-    if "source" not in registrant_cols:
+    cols = [row[1] for row in cur.fetchall()]
+    if "source" not in cols:
         cur.execute("ALTER TABLE registrants ADD COLUMN source TEXT DEFAULT 'imported'")
 
     cur.execute(
@@ -106,8 +98,14 @@ def init_db() -> None:
     conn.close()
 
 
+@app.before_request
+def ensure_db() -> None:
+    # 避免 Render / Gunicorn 启动阶段直接 crash
+    init_db()
+
+
 # -----------------------------
-# Utils
+# 工具函数
 # -----------------------------
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -127,13 +125,16 @@ def normalize_email(value: object) -> str:
 
 def pick_column(columns: list[str], candidates: list[str]) -> Optional[str]:
     low_map = {str(c).strip().lower(): c for c in columns}
+
     for cand in candidates:
         if cand.lower() in low_map:
             return low_map[cand.lower()]
+
     for col in columns:
         low = str(col).strip().lower()
         if any(c.lower() in low for c in candidates):
             return col
+
     return None
 
 
@@ -151,6 +152,8 @@ def import_excel_to_db(file_bytes: bytes, event_id: str) -> int:
 
     conn = get_conn()
     cur = conn.cursor()
+
+    # 同一活动重新导入时，覆盖旧名单与旧签到
     cur.execute("DELETE FROM checkins WHERE event_id = ?", (event_id,))
     cur.execute("DELETE FROM registrants WHERE event_id = ?", (event_id,))
 
@@ -166,7 +169,8 @@ def import_excel_to_db(file_bytes: bytes, event_id: str) -> int:
 
         cur.execute(
             """
-            INSERT INTO registrants (event_id, name, phone, email, organization, source, raw_json, created_at)
+            INSERT INTO registrants
+            (event_id, name, phone, email, organization, source, raw_json, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -190,29 +194,40 @@ def import_excel_to_db(file_bytes: bytes, event_id: str) -> int:
 def find_registrant(event_id: str, phone: str, email: str):
     conn = get_conn()
     cur = conn.cursor()
-    result = None
+
+    row = None
     if phone:
         cur.execute(
             "SELECT * FROM registrants WHERE event_id = ? AND phone = ? LIMIT 1",
             (event_id, phone),
         )
-        result = cur.fetchone()
-    if result is None and email:
+        row = cur.fetchone()
+
+    if row is None and email:
         cur.execute(
             "SELECT * FROM registrants WHERE event_id = ? AND email = ? LIMIT 1",
             (event_id, email),
         )
-        result = cur.fetchone()
+        row = cur.fetchone()
+
     conn.close()
-    return result
+    return row
 
 
-def create_walkin_registrant(event_id: str, name: str, phone: str, email: str, organization: str):
+def create_walkin_registrant(
+    event_id: str,
+    name: str,
+    phone: str,
+    email: str,
+    organization: str,
+):
     conn = get_conn()
     cur = conn.cursor()
+
     cur.execute(
         """
-        INSERT INTO registrants (event_id, name, phone, email, organization, source, raw_json, created_at)
+        INSERT INTO registrants
+        (event_id, name, phone, email, organization, source, raw_json, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
@@ -228,6 +243,7 @@ def create_walkin_registrant(event_id: str, name: str, phone: str, email: str, o
     )
     registrant_id = cur.lastrowid
     conn.commit()
+
     cur.execute("SELECT * FROM registrants WHERE id = ?", (registrant_id,))
     row = cur.fetchone()
     conn.close()
@@ -246,13 +262,15 @@ def insert_checkin(
 ) -> tuple[bool, str]:
     conn = get_conn()
     cur = conn.cursor()
+
     try:
         cur.execute(
             """
             INSERT INTO checkins (
                 event_id, registrant_id, submitted_phone, submitted_email,
                 status, message, ip, user_agent, checked_in_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event_id,
@@ -275,7 +293,7 @@ def insert_checkin(
 
 
 # -----------------------------
-# Shared HTML
+# HTML 基础模板
 # -----------------------------
 BASE_HTML = """
 <!doctype html>
@@ -330,9 +348,7 @@ th { background:#f9fafb; position:sticky; top:0; }
   max-width:430px; margin:0 auto; min-height:760px; background:linear-gradient(180deg,#eef5ff,#f8fbff);
   border-radius:28px; padding:18px; box-shadow:0 18px 38px rgba(0,0,0,.08);
 }
-.wx-header {
-  padding:16px 8px 18px; text-align:center;
-}
+.wx-header { padding:16px 8px 18px; text-align:center; }
 .wx-title { font-size:22px; font-weight:800; }
 .wx-sub { color:var(--muted); font-size:13px; margin-top:6px; }
 .wx-card { background:#fff; border-radius:20px; padding:18px; box-shadow:0 8px 24px rgba(0,0,0,.06); margin-bottom:14px; }
@@ -351,8 +367,15 @@ def page(title: str, body: str):
     return render_template_string(BASE_HTML, title=title, body=body)
 
 
+def make_msg_html(msg_text: str, msg_type: str = "ok") -> str:
+    if not msg_text:
+        return ""
+    css = "ok" if msg_type == "ok" else "err"
+    return f'<div class="{css}" style="margin-bottom:16px;">{msg_text}</div>'
+
+
 # -----------------------------
-# Routes: Admin
+# 路由：后台
 # -----------------------------
 @app.route("/")
 def root():
@@ -361,32 +384,35 @@ def root():
 
 @app.route("/admin", methods=["GET", "POST"])
 def admin():
-    msg = ""
-
     msg_text = request.args.get("msg", "").strip()
     msg_type = request.args.get("msg_type", "ok").strip()
-    if msg_text:
-        css = "ok" if msg_type == "ok" else "err"
-        msg = f'<div class="{css}">{msg_text}</div>'
+    msg_html = make_msg_html(msg_text, msg_type)
+
     if request.method == "POST":
         event_id = request.form.get("event_id", "").strip()
         file = request.files.get("file")
+
         if not event_id:
-            msg = '<div class="err">请先填写活动 ID。</div>'
-        elif not file or not file.filename:
-            msg = '<div class="err">请上传 Excel 名单。</div>'
-        else:
-            try:
-                count = import_excel_to_db(file.read(), event_id)
-                msg = (
-                    f'<div class="ok">导入成功，共导入 <strong>{count}</strong> 条名单。'
-                    f'移动端签到链接：<code>/m/checkin?event_id={event_id}</code></div>'
+            return redirect(url_for("admin", msg="请先填写活动 ID。", msg_type="err"))
+
+        if not file or not file.filename:
+            return redirect(url_for("admin", msg="请上传 Excel 名单。", msg_type="err"))
+
+        try:
+            count = import_excel_to_db(file.read(), event_id)
+            return redirect(
+                url_for(
+                    "admin",
+                    msg=f"导入成功，共导入 {count} 条名单。移动端签到链接：/m/checkin?event_id={event_id}",
+                    msg_type="ok",
                 )
-            except Exception as e:
-                msg = f'<div class="err">导入失败：{e}</div>'
+            )
+        except Exception as e:
+            return redirect(url_for("admin", msg=f"导入失败：{e}", msg_type="err"))
 
     conn = get_conn()
     cur = conn.cursor()
+
     cur.execute(
         """
         SELECT r.event_id,
@@ -403,10 +429,13 @@ def admin():
 
     cur.execute("SELECT COUNT(*) AS c FROM registrants")
     total_reg = cur.fetchone()["c"]
+
     cur.execute("SELECT COUNT(*) AS c FROM checkins WHERE status='success'")
     total_success = cur.fetchone()["c"]
+
     cur.execute("SELECT COUNT(*) AS c FROM checkins WHERE status='failed'")
     total_failed = cur.fetchone()["c"]
+
     conn.close()
 
     table_rows = "".join(
@@ -425,11 +454,6 @@ def admin():
         for r in rows
     )
 
-    message_html = ""
-    if msg_text:
-        css = "ok" if msg_type == "ok" else "err"
-        message_html = f'<div class="{css}" style="margin-bottom:16px;">{msg_text}</div>'
-
     body = f"""
     <div class="topbar">
       <div>
@@ -446,7 +470,7 @@ def admin():
       <div class="stat"><div class="k">活动数量</div><div class="v">{len(rows)}</div></div>
     </div>
 
-    {msg}
+    {msg_html}
 
     <div class="grid grid-2">
       <div class="card">
@@ -478,7 +502,7 @@ def admin():
         <input name="name" placeholder="访客姓名" required>
         <input name="phone" placeholder="手机号（建议填写）">
         <input name="email" placeholder="邮箱（手机号不便时可填）">
-        <input name="organization" placeholder="单位 / 公司 / 机构（可选)">
+        <input name="organization" placeholder="单位 / 公司 / 机构（可选）">
         <button type="submit">登记并补签</button>
       </form>
       <p class="sub">适用于现场临时来宾、未提前报名但允许入场的情况。系统会先检查该手机号/邮箱是否已在名单中；若没有，则新增为临时访客并立即签到，后续也会出现在导出表格里。</p>
@@ -511,11 +535,7 @@ def admin_records():
     event_id = request.args.get("event_id", "").strip()
     msg_text = request.args.get("msg", "").strip()
     msg_type = request.args.get("msg_type", "ok").strip()
-
-    message_html = ""
-    if msg_text:
-        css = "ok" if msg_type == "ok" else "err"
-        message_html = f'<div class="{css}" style="margin-bottom:16px;">{msg_text}</div>'
+    msg_html = make_msg_html(msg_text, msg_type)
 
     conn = get_conn()
     cur = conn.cursor()
@@ -558,7 +578,8 @@ def admin_records():
       </div>
     </div>
 
-    {message_html}
+    {msg_html}
+
     <div class="card">
       <div class="table-wrap">
         <table>
@@ -576,6 +597,7 @@ def admin_records():
 @app.route("/admin/export")
 def admin_export():
     event_id = request.args.get("event_id", "").strip()
+
     conn = get_conn()
     query = """
         SELECT c.event_id AS 活动ID,
@@ -584,6 +606,7 @@ def admin_export():
                c.message AS 说明,
                r.name AS 姓名,
                r.organization AS 单位,
+               r.source AS 来源,
                r.phone AS 名单手机号,
                r.email AS 名单邮箱,
                c.submitted_phone AS 提交手机号,
@@ -622,7 +645,7 @@ def admin_delete():
     conn.commit()
     conn.close()
 
-    return redirect(url_for("admin"))
+    return redirect(url_for("admin", msg=f"已删除活动：{event_id}", msg_type="ok"))
 
 
 @app.route("/admin/manual_checkin", methods=["POST"])
@@ -633,7 +656,6 @@ def admin_manual_checkin():
 
     if not event_id:
         return redirect(url_for("admin", msg="请先填写活动ID。", msg_type="err"))
-
     if not phone and not email:
         return redirect(url_for("admin", msg="请至少填写手机号或邮箱。", msg_type="err"))
 
@@ -659,14 +681,7 @@ def admin_manual_checkin():
     )
 
     if not ok:
-        return redirect(
-            url_for(
-                "admin_records",
-                event_id=event_id,
-                msg=insert_msg,
-                msg_type="err",
-            )
-        )
+        return redirect(url_for("admin_records", event_id=event_id, msg=insert_msg, msg_type="err"))
 
     display_name = registrant["name"] or "该参会者"
     return redirect(
@@ -708,8 +723,16 @@ def admin_walkin_checkin():
         )
         if not ok:
             return redirect(url_for("admin_records", event_id=event_id, msg=insert_msg, msg_type="err"))
+
         display_name = existing["name"] or name
-        return redirect(url_for("admin_records", event_id=event_id, msg=f"已在名单中找到该来宾，补签成功：{display_name}", msg_type="ok"))
+        return redirect(
+            url_for(
+                "admin_records",
+                event_id=event_id,
+                msg=f"已在名单中找到该来宾，补签成功：{display_name}",
+                msg_type="ok",
+            )
+        )
 
     walkin = create_walkin_registrant(event_id, name, phone, email, organization)
     ok, insert_msg = insert_checkin(
@@ -722,6 +745,7 @@ def admin_walkin_checkin():
         ip="admin-walkin",
         user_agent="admin-walkin",
     )
+
     if not ok:
         return redirect(url_for("admin_records", event_id=event_id, msg=insert_msg, msg_type="err"))
 
@@ -734,8 +758,9 @@ def admin_walkin_checkin():
         )
     )
 
+
 # -----------------------------
-# Routes: Mobile (Mini-program style H5)
+# 路由：移动端签到
 # -----------------------------
 @app.route("/m/checkin", methods=["GET", "POST"])
 def mobile_checkin():
@@ -745,6 +770,7 @@ def mobile_checkin():
     if request.method == "POST":
         phone = normalize_phone(request.form.get("phone", ""))
         email = normalize_email(request.form.get("email", ""))
+
         if not event_id:
             result = '<div class="err">缺少活动 ID，请联系工作人员。</div>'
         elif not phone and not email:
@@ -827,7 +853,7 @@ def mobile_checkin():
 
 
 # -----------------------------
-# Optional JSON API
+# API
 # -----------------------------
 @app.route("/api/checkin", methods=["POST"])
 def api_checkin():
@@ -853,15 +879,18 @@ def api_checkin():
     if not ok:
         return jsonify({"ok": False, "message": msg}), 409
 
-    return jsonify({
-        "ok": True,
-        "message": "签到成功",
-        "name": registrant["name"],
-        "organization": registrant["organization"],
-    })
+    return jsonify(
+        {
+            "ok": True,
+            "message": "签到成功",
+            "name": registrant["name"],
+            "organization": registrant["organization"],
+        }
+    )
 
+
+# 供 gunicorn / wsgi 使用
+application = app
 
 if __name__ == "__main__":
-    init_db()
-    # 某些在线 IDE / 精简 Python 环境不支持 debug reloader，容易触发 _multiprocessing 报错
     app.run(host="0.0.0.0", port=5001, debug=False, use_reloader=False)
