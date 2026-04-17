@@ -45,6 +45,9 @@ DB_PATH = DATA_DIR / "checkin_mini.db"
 app = Flask(__name__)
 app.secret_key = "replace-this-with-random-secret"
 
+with app.app_context():
+    init_db()
+
 
 # -----------------------------
 # DB
