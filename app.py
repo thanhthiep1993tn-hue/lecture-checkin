@@ -1233,14 +1233,29 @@ def admin_records():
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT c.checked_in_at, c.status, c.message, c.checkin_method,
-               c.has_webull_account,
-               r.name, r.phone, r.email, r.organization, r.source, r.webull_opened,
-               r.qr_used_at, c.submitted_phone, c.submitted_email
-        FROM checkins c
-        LEFT JOIN registrants r ON c.registrant_id = r.id
-        WHERE c.event_id = ?
-        ORDER BY c.checked_in_at DESC
+        SELECT
+            r.id AS registrant_id,
+            r.event_id,
+            r.name,
+            r.phone,
+            r.email,
+            r.organization,
+            r.source,
+            r.has_webull_account,
+            r.webull_opened,
+            r.qr_sent_at,
+            r.qr_used_at,
+            r.checkin_token,
+            c.checked_in_at,
+            c.status,
+            c.checkin_method,
+            c.message
+        FROM registrants r
+        LEFT JOIN checkins c
+            ON r.id = c.registrant_id
+           AND r.event_id = c.event_id
+        WHERE r.event_id = ?
+        ORDER BY r.id ASC
         """,
         (event_id,),
     )
@@ -1249,16 +1264,21 @@ def admin_records():
 
     table_rows = "".join(
         f"<tr>"
-        f"<td>{x['checked_in_at']}</td>"
-        f"<td>{x['status']}</td>"
-        f"<td>{x['checkin_method'] or ''}</td>"
+        f"<td>{x['registrant_id']}</td>"
         f"<td>{x['name'] or ''}</td>"
-        f"<td>{(x['organization'] or '') + ('（临时访客）' if x['source'] == 'walkin' else '')}</td>"
-        f"<td>{x['phone'] or x['submitted_phone'] or ''}</td>"
-        f"<td>{x['email'] or x['submitted_email'] or ''}</td>"
+        f"<td>{x['phone'] or ''}</td>"
+        f"<td>{x['email'] or ''}</td>"
+        f"<td>{x['organization'] or ''}</td>"
+        f"<td>{x['source'] or ''}</td>"
         f"<td>{x['has_webull_account'] or ''}</td>"
         f"<td>{x['webull_opened'] or ''}</td>"
-        f"<td>{x['message'] or ''}</td>"
+        f"<td>{x['checked_in_at'] or '未签到'}</td>"
+        f"<td>{x['checkin_method'] or ''}</td>"
+        f"<td>{x['qr_sent_at'] or ''}</td>"
+        f"<td>"
+        f"<a href='/admin/send_one_email?id={x['registrant_id']}'>发送邮件</a> | "
+        f"<a href='/qr_image?token={x['checkin_token']}' target='_blank'>二维码</a>"
+        f"</td>"
         f"</tr>"
         for x in rows
     )
@@ -1266,22 +1286,38 @@ def admin_records():
     body = f"""
     <div class="topbar">
       <div>
-        <div class="brand" style="font-size:24px;">签到记录</div>
-        <div class="sub">活动 ID:{event_id}</div>
+        <div class="brand" style="font-size:24px;">活动名单与签到记录</div>
+        <div class="sub">活动 ID: {event_id}</div>
       </div>
-      <div><a href="/admin">返回后台</a> | <a href="/admin/export?event_id={event_id}">导出 Excel</a></div>
+      <div>
+        <a href="/admin">返回后台</a> |
+        <a href="/admin/export?event_id={event_id}">导出签到记录</a> |
+        <a href="/admin/export_qr_links?event_id={event_id}">导出二维码链接</a>
+      </div>
     </div>
+
     {msg_html}
+
     <div class="card">
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
-              <th>签到时间</th><th>状态</th><th>方式</th><th>姓名</th><th>单位</th><th>手机号</th><th>邮箱</th>
-              <th>是否已有Webull账户</th><th>是否已完成Webull注册开户</th><th>说明</th>
+              <th>ID</th>
+              <th>姓名</th>
+              <th>手机号</th>
+              <th>邮箱</th>
+              <th>单位</th>
+              <th>来源</th>
+              <th>是否已有Webull账户</th>
+              <th>是否已完成开户</th>
+              <th>签到时间</th>
+              <th>签到方式</th>
+              <th>邮件发送时间</th>
+              <th>操作</th>
             </tr>
           </thead>
-          <tbody>{table_rows or '<tr><td colspan="10">暂无记录</td></tr>'}</tbody>
+          <tbody>{table_rows or '<tr><td colspan="12">暂无名单</td></tr>'}</tbody>
         </table>
       </div>
     </div>
