@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import io
+import os
 import re
 import secrets
 import sqlite3
+import smtplib
 from datetime import datetime
+from email.message import EmailMessage
+from email.utils import formataddr
 from pathlib import Path
 from typing import Optional
 
@@ -61,6 +65,17 @@ app.secret_key = "replace-this-with-a-random-secret-key"
 # 工作人员扫码口令:上线前请改成你们内部口令。
 # 之后也可以改成环境变量:os.environ.get("STAFF_SCAN_PASSWORD")
 STAFF_SCAN_PASSWORD = "webull-staff-2026"
+
+# -----------------------------
+# Email configuration
+# -----------------------------
+# For safety, do not hard-code your Gmail App Password here.
+# Set EMAIL_PASS in Render -> Settings -> Environment.
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 587
+SMTP_USER = "blakezhong23@gmail.com"
+SMTP_PASSWORD = os.environ.get("EMAIL_PASS")
+FROM_NAME = "Webull Event Team"
 
 
 # -----------------------------
@@ -203,6 +218,61 @@ def make_msg_html(msg_text: str, msg_type: str = "ok") -> str:
 def get_base_url() -> str:
     # Render / 反向代理场景下优先使用用户实际访问的 host
     return request.host_url.rstrip("/")
+
+
+def send_qr_email(to_email: str, name: str, event_id: str, qr_link: str, qr_image_url: str) -> None:
+    """Send the personal QR check-in email to one attendee."""
+    if not SMTP_PASSWORD:
+        raise RuntimeError("EMAIL_PASS is not set in environment variables.")
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Your Check-in QR Code for {event_id}"
+    msg["From"] = formataddr((FROM_NAME, SMTP_USER))
+    msg["To"] = to_email
+
+    plain_text = f"""Dear {name or "Guest"},
+
+Thank you for registering.
+
+Please present your personal QR code when you arrive at the venue. Our staff will scan it to complete your check-in.
+
+Check-in link:
+{qr_link}
+
+Best regards,
+Webull Event Team
+"""
+
+    html = f"""
+    <html>
+      <body style="font-family: Arial, sans-serif; line-height: 1.6;">
+        <p>Dear {name or "Guest"},</p>
+
+        <p>Thank you for registering.</p>
+
+        <p>Please present this QR code when you arrive at the venue. Our staff will scan it to complete your check-in.</p>
+
+        <p>
+          <img src="{qr_image_url}" alt="Check-in QR Code" style="width:220px;height:220px;" />
+        </p>
+
+        <p>If the QR code image does not display, please open this link:</p>
+        <p><a href="{qr_link}">{qr_link}</a></p>
+
+        <p>Event ID: {event_id}</p>
+
+        <p>Best regards,<br>Webull Event Team</p>
+      </body>
+    </html>
+    """
+
+    msg.set_content(plain_text)
+    msg.add_alternative(html, subtype="html")
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.send_message(msg)
 
 
 def generate_unique_token() -> str:
@@ -563,6 +633,7 @@ def admin():
         f"<a href='/m/checkin?event_id={r['event_id']}'>手填签到页</a> | "
         f"<a href='/admin/generate_qr_tokens?event_id={r['event_id']}'>生成二维码Token</a> | "
         f"<a href='/admin/export_qr_links?event_id={r['event_id']}'>导出二维码链接</a> | "
+        f"<a href='/admin/send_qr_emails?event_id={r['event_id']}' onclick=\"return confirm('确定向该活动所有有邮箱的用户发送二维码邮件？');\">发送二维码邮件</a> | "
         f"<a href='/admin/records?event_id={r['event_id']}'>签到记录</a> | "
         f"<a href='/admin/export?event_id={r['event_id']}'>导出记录</a> | "
         f"<a href='/admin/delete?event_id={r['event_id']}' onclick=\"return confirm('确定删除该活动所有数据？');\">删除</a>"
@@ -886,6 +957,70 @@ def admin_export_qr_links():
     )
 
 
+
+@app.route("/admin/send_qr_emails")
+def admin_send_qr_emails():
+    event_id = request.args.get("event_id", "").strip()
+    if not event_id:
+        return redirect(url_for("admin", msg="缺少活动 ID。", msg_type="err"))
+
+    ensure_tokens_for_event(event_id)
+    base_url = get_base_url()
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, event_id, name, email, checkin_token
+        FROM registrants
+        WHERE event_id = ?
+          AND email IS NOT NULL
+          AND email != ''
+        ORDER BY id
+        """,
+        (event_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    sent = 0
+    failed = 0
+
+    for r in rows:
+        try:
+            qr_link = f"{base_url}/qr_checkin?token={r['checkin_token']}"
+            qr_image_url = f"{base_url}/qr_image?token={r['checkin_token']}"
+
+            send_qr_email(
+                to_email=r["email"],
+                name=r["name"],
+                event_id=event_id,
+                qr_link=qr_link,
+                qr_image_url=qr_image_url,
+            )
+
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE registrants SET qr_sent_at = ? WHERE id = ?",
+                (now_str(), r["id"]),
+            )
+            conn.commit()
+            conn.close()
+
+            sent += 1
+        except Exception:
+            failed += 1
+
+    return redirect(
+        url_for(
+            "admin",
+            msg=f"二维码邮件发送完成: 成功 {sent} 封, 失败 {failed} 封。",
+            msg_type="ok" if failed == 0 else "err",
+        )
+    )
+
+
 @app.route("/qr_image")
 def qr_image():
     token = request.args.get("token", "").strip()
@@ -981,6 +1116,7 @@ def qr_checkin():
         cur.execute("UPDATE registrants SET qr_used_at = ? WHERE id = ?", (checked_time, registrant["id"]))
         conn.commit()
         conn.close()
+
         result = f"""
         <div class="success-box">
           <div class="success-icon">✅</div>
@@ -990,7 +1126,6 @@ def qr_checkin():
         </div>
         """
     else:
-        # 重复扫码时继续显示“核验成功”，但不重复写入 checkins。
         result = f"""
         <div class="success-box">
           <div class="success-icon">✅</div>
@@ -1029,9 +1164,20 @@ def qr_checkin():
       <div class="wx-card">
         <a href="/staff/scan"><button class="wx-btn" type="button">继续扫描下一位</button></a>
       </div>
+
+      <div class="wx-card">
+        <h3 style="margin:0 0 8px;">工作人员提示</h3>
+        <ul style="padding-left:18px; margin:8px 0; line-height:1.8;">
+          <li>请核对姓名、手机号或邮箱是否与到场人员一致。</li>
+          <li>重复扫描会显示核验成功，但后台只保留第一次签到记录。</li>
+          <li>若二维码无效，请回后台使用“手动补签”或“临时访客登记”。</li>
+        </ul>
+      </div>
     </div>
     """
     return page("二维码签到", body)
+
+
 
 
 # -----------------------------
