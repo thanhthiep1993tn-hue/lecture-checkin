@@ -736,6 +736,45 @@ def admin():
     return page("讲座签到后台", body)
 
 
+@app.route("/admin/send_one_email")
+def send_one_email():
+    rid = request.args.get("id")
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, name, email, checkin_token, event_id FROM registrants WHERE id=?",
+        (rid,)
+    )
+    r = cur.fetchone()
+    conn.close()
+
+    if not r:
+        return redirect(url_for("admin", msg="用户不存在", msg_type="err"))
+
+    if not r["email"]:
+        return redirect(url_for("admin", msg="该用户没有邮箱，无法发送", msg_type="err"))
+
+    base_url = get_base_url()
+    qr_link = f"{base_url}/qr_checkin?token={r['checkin_token']}"
+    qr_img = f"{base_url}/qr_image?token={r['checkin_token']}"
+
+    try:
+        send_qr_email(r["email"], r["name"], r["event_id"], qr_link, qr_img)
+
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE registrants SET qr_sent_at = ? WHERE id = ?",
+            (now_str(), r["id"])
+        )
+        conn.commit()
+        conn.close()
+
+        return redirect(url_for("admin", msg=f"邮件发送成功: {r['email']}", msg_type="ok"))
+
+    except Exception as e:
+        return redirect(url_for("admin", msg=f"邮件发送失败: {e}", msg_type="err"))
 # -----------------------------
 # 工作人员扫码入口与权限控制
 # -----------------------------
