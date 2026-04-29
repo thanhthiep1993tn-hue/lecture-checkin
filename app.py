@@ -17,6 +17,7 @@ from flask import (
     request,
     send_file,
     url_for,
+    session,
 )
 
 # ============================================================
@@ -56,6 +57,10 @@ DB_PATH = DATA_DIR / "checkin_mini.db"
 
 app = Flask(__name__)
 app.secret_key = "replace-this-with-a-random-secret-key"
+
+# 工作人员扫码口令：上线前请改成你们内部口令。
+# 之后也可以改成环境变量：os.environ.get("STAFF_SCAN_PASSWORD")
+STAFF_SCAN_PASSWORD = "webull-staff-2026"
 
 
 # -----------------------------
@@ -641,7 +646,8 @@ def admin():
       <h3 style="margin-top:0;">二维码签到说明</h3>
       <p>导入名单后，系统会为每位用户生成唯一二维码 token。</p>
       <p>点击“导出二维码链接”，即可得到每位用户的专属签到链接。你可以把该链接或二维码发到用户邮箱。</p>
-      <p>现场扫码后访问 <code>/qr_checkin?token=...</code>，系统会自动完成签到。</p>
+      <p>现场必须由工作人员进入“现场扫码模式”后扫描，用户自己扫描二维码不会完成签到。</p>
+      <p><a href="/staff/scan" style="font-weight:800;">进入现场扫码模式</a></p>
     </div>
 
     <div class="card" style="margin-top:16px;">
@@ -657,6 +663,130 @@ def admin():
     </div>
     """
     return page("讲座签到后台", body)
+
+
+# -----------------------------
+# 工作人员扫码入口与权限控制
+# -----------------------------
+def staff_is_logged_in() -> bool:
+    return session.get("staff_logged_in") is True
+
+
+@app.route("/staff/login", methods=["GET", "POST"])
+def staff_login():
+    msg = ""
+    next_url = request.args.get("next", "/staff/scan")
+
+    if request.method == "POST":
+        password = request.form.get("password", "").strip()
+        next_url = request.form.get("next", "/staff/scan").strip() or "/staff/scan"
+        if password == STAFF_SCAN_PASSWORD:
+            session["staff_logged_in"] = True
+            return redirect(next_url)
+        msg = '<div class="err">工作人员口令错误，请重试。</div>'
+
+    body = f"""
+    <div class="mini-phone">
+      <div class="wx-header">
+        <div class="badge">工作人员入口</div>
+        <div class="wx-title">扫码权限验证</div>
+        <div class="wx-sub">只有工作人员登录后，扫码才会完成签到</div>
+      </div>
+      <div class="wx-card">
+        {msg}
+        <form method="post" class="grid">
+          <input type="hidden" name="next" value="{next_url}">
+          <input type="password" name="password" placeholder="请输入工作人员口令" required>
+          <button class="wx-btn" type="submit">进入现场扫码模式</button>
+        </form>
+      </div>
+    </div>
+    """
+    return page("工作人员登录", body)
+
+
+@app.route("/staff/logout")
+def staff_logout():
+    session.pop("staff_logged_in", None)
+    return redirect(url_for("staff_login", msg="已退出"))
+
+
+@app.route("/staff/scan")
+def staff_scan():
+    if not staff_is_logged_in():
+        return redirect(url_for("staff_login", next="/staff/scan"))
+
+    body = """
+    <div class="mini-phone">
+      <div class="wx-header">
+        <div class="badge">现场工作人员</div>
+        <div class="wx-title">现场扫码模式</div>
+        <div class="wx-sub">扫描参会者邮件中的个人二维码</div>
+      </div>
+
+      <div class="wx-card">
+        <div id="reader" style="width:100%; min-height:280px;"></div>
+        <div id="scan-result" class="sub" style="margin-top:12px;">请允许浏览器访问摄像头，然后对准参会者二维码。</div>
+      </div>
+
+      <div class="wx-card">
+        <h3 style="margin:0 0 8px;">工作人员说明</h3>
+        <ul style="padding-left:18px; margin:8px 0; line-height:1.8;">
+          <li>只有从这个页面扫码，系统才会确认签到。</li>
+          <li>二维码内容应为 <code>/qr_checkin?token=...</code>。</li>
+          <li>扫码成功后会跳转到核验页，显示姓名、手机号、邮箱等信息。</li>
+          <li>若摄像头不可用，可用手机系统相机扫码；但必须先在本浏览器登录工作人员口令。</li>
+        </ul>
+        <p><a href="/staff/logout">退出工作人员模式</a></p>
+      </div>
+    </div>
+
+    <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
+    <script>
+      function extractToken(decodedText) {
+        try {
+          const url = new URL(decodedText);
+          return url.searchParams.get("token");
+        } catch (e) {
+          const match = decodedText.match(/token=([^&]+)/);
+          return match ? decodeURIComponent(match[1]) : null;
+        }
+      }
+
+      function onScanSuccess(decodedText, decodedResult) {
+        const resultBox = document.getElementById("scan-result");
+        const token = extractToken(decodedText);
+        if (!token) {
+          resultBox.innerHTML = "<span style='color:#dc2626;font-weight:700;'>二维码格式不正确，未找到 token。</span>";
+          return;
+        }
+        resultBox.innerHTML = "<span style='color:#166534;font-weight:700;'>扫码成功，正在核验签到...</span>";
+        window.location.href = "/qr_checkin?token=" + encodeURIComponent(token);
+      }
+
+      function onScanFailure(error) {
+        // 连续扫描时会频繁触发，不需要显示错误
+      }
+
+      const html5QrCode = new Html5Qrcode("reader");
+      Html5Qrcode.getCameras().then(devices => {
+        if (devices && devices.length) {
+          const cameraId = devices[0].id;
+          html5QrCode.start(
+            cameraId,
+            { fps: 10, qrbox: { width: 240, height: 240 } },
+            onScanSuccess,
+            onScanFailure
+          );
+        } else {
+          document.getElementById("scan-result").innerHTML = "<span style='color:#dc2626;'>未检测到摄像头。</span>";
+        }
+      }).catch(err => {
+        document.getElementById("scan-result").innerHTML = "<span style='color:#dc2626;'>无法启动摄像头，请检查浏览器权限或改用手机系统相机。</span>";
+      });
+    </script>
+    """
+    return page("现场扫码模式", body)
 
 
 # -----------------------------
@@ -729,6 +859,24 @@ def qr_image():
 
 @app.route("/qr_checkin")
 def qr_checkin():
+    if not staff_is_logged_in():
+        next_url = request.full_path if request.query_string else request.path
+        body = f"""
+        <div class="mini-phone">
+          <div class="wx-header">
+            <div class="badge">工作人员权限</div>
+            <div class="wx-title">需要工作人员确认</div>
+            <div class="wx-sub">该二维码只能由工作人员扫码确认签到</div>
+          </div>
+          <div class="wx-card">
+            <div class="err">你当前不是工作人员扫码模式，因此不会完成签到。</div>
+            <p class="sub">请工作人员点击下方按钮登录后，再扫描或打开该二维码链接。</p>
+            <a href="/staff/login?next={next_url}"><button class="wx-btn" type="button">工作人员登录并继续核验</button></a>
+          </div>
+        </div>
+        """
+        return page("需要工作人员权限", body)
+
     """工作人员扫描参会者个人二维码后的核验签到页。
 
     这个页面不是给用户自己填信息用的，而是给现场工作人员扫码后确认：
