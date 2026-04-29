@@ -727,6 +727,7 @@ def staff_scan():
       <div class="wx-card">
         <div id="reader" style="width:100%; min-height:280px;"></div>
         <div id="scan-result" class="sub" style="margin-top:12px;">请允许浏览器访问摄像头，然后对准参会者二维码。</div>
+        <button id="switch-camera-btn" class="wx-btn" type="button" style="margin-top:12px;">切换摄像头</button>
       </div>
 
       <div class="wx-card">
@@ -768,16 +769,63 @@ def staff_scan():
         // 连续扫描时会频繁触发，不需要显示错误
       }
 
-      const html5QrCode = new Html5Qrcode("reader");
+      let html5QrCode = new Html5Qrcode("reader");
+      let cameras = [];
+      let currentCameraIndex = 0;
+      let isScanning = false;
+
+      function pickBackCameraIndex(devices) {
+        // 尽量优先选后置摄像头。不同手机浏览器命名不一样，所以做多关键词匹配。
+        const keywords = ["back", "rear", "environment", "后置", "背面"];
+        const idx = devices.findIndex(d => {
+          const label = (d.label || "").toLowerCase();
+          return keywords.some(k => label.includes(k));
+        });
+        return idx >= 0 ? idx : 0;
+      }
+
+      function startCamera(index) {
+        if (!cameras.length) return;
+        const cameraId = cameras[index].id;
+        const resultBox = document.getElementById("scan-result");
+        resultBox.innerHTML = "正在启动摄像头...";
+
+        html5QrCode.start(
+          cameraId,
+          { fps: 10, qrbox: { width: 240, height: 240 } },
+          onScanSuccess,
+          onScanFailure
+        ).then(() => {
+          isScanning = true;
+          const label = cameras[index].label || `摄像头 ${index + 1}`;
+          resultBox.innerHTML = `当前摄像头：${label}`;
+        }).catch(err => {
+          resultBox.innerHTML = "<span style='color:#dc2626;'>无法启动摄像头，请检查浏览器权限。</span>";
+        });
+      }
+
+      function switchCamera() {
+        if (!cameras.length) return;
+        currentCameraIndex = (currentCameraIndex + 1) % cameras.length;
+        if (isScanning) {
+          html5QrCode.stop().then(() => {
+            isScanning = false;
+            startCamera(currentCameraIndex);
+          }).catch(() => {
+            startCamera(currentCameraIndex);
+          });
+        } else {
+          startCamera(currentCameraIndex);
+        }
+      }
+
+      document.getElementById("switch-camera-btn").addEventListener("click", switchCamera);
+
       Html5Qrcode.getCameras().then(devices => {
-        if (devices && devices.length) {
-          const cameraId = devices[0].id;
-          html5QrCode.start(
-            cameraId,
-            { fps: 10, qrbox: { width: 240, height: 240 } },
-            onScanSuccess,
-            onScanFailure
-          );
+        cameras = devices || [];
+        if (cameras.length) {
+          currentCameraIndex = pickBackCameraIndex(cameras);
+          startCamera(currentCameraIndex);
         } else {
           document.getElementById("scan-result").innerHTML = "<span style='color:#dc2626;'>未检测到摄像头。</span>";
         }
