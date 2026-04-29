@@ -1097,7 +1097,7 @@ def qr_checkin():
       <div class="wx-header">
         <div class="badge">二维码签到</div>
         <div class="wx-title">讲座签到</div>
-        <div class="wx-sub">活动 ID：{event_id}</div>
+        <div class="wx-sub">活动 ID:{event_id}</div>
       </div>
       <div class="wx-card">
         {result}
