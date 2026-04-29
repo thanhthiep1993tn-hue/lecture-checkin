@@ -925,14 +925,6 @@ def qr_checkin():
         """
         return page("需要工作人员权限", body)
 
-    """工作人员扫描参会者个人二维码后的核验签到页。
-
-    这个页面不是给用户自己填信息用的，而是给现场工作人员扫码后确认:
-    - token 是否有效
-    - 参会者是谁
-    - 是否已经签到过
-    - 本次扫码是否成功写入后台
-    """
     token = request.args.get("token", "").strip()
     checked_time = now_str()
 
@@ -944,7 +936,7 @@ def qr_checkin():
             <div class="wx-title">二维码核验</div>
           </div>
           <div class="wx-card">
-            <div class="err">二维码无效:缺少 token。请让参会者重新出示二维码，或联系后台工作人员。</div>
+            <div class="err">二维码无效: 缺少 token。请让参会者重新出示二维码，或联系后台工作人员。</div>
           </div>
         </div>
         """
@@ -989,21 +981,23 @@ def qr_checkin():
         cur.execute("UPDATE registrants SET qr_used_at = ? WHERE id = ?", (checked_time, registrant["id"]))
         conn.commit()
         conn.close()
-
         result = f"""
         <div class="success-box">
           <div class="success-icon">✅</div>
           <div class="success-title">签到成功</div>
-          <div style="margin-top:12px;font-size:17px;color:#14532d;">请确认参会者信息</div>
+          <div style="margin-top:10px;font-size:16px;color:#14532d;">欢迎你，<strong>{registrant['name'] or '参会者'}</strong></div>
+          <div style="margin-top:8px;font-size:14px;color:#166534;">本次为首次签到，已写入后台记录。</div>
         </div>
         """
     else:
-        # 这里通常表示该 token 对应用户已经签到过
+        # 重复扫码时继续显示“核验成功”，但不重复写入 checkins。
         result = f"""
-        <div class="err" style="text-align:center;">
-          <div style="font-size:38px;line-height:1;margin-bottom:8px;">⚠️</div>
-          <div style="font-size:22px;font-weight:800;">无法重复签到</div>
-          <div style="margin-top:8px;">{msg}</div>
+        <div class="success-box">
+          <div class="success-icon">✅</div>
+          <div class="success-title">核验成功</div>
+          <div style="margin-top:10px;font-size:16px;color:#14532d;">欢迎你，<strong>{registrant['name'] or '参会者'}</strong></div>
+          <div style="margin-top:8px;font-size:14px;color:#166534;">该二维码此前已完成签到，本次不重复记录。</div>
+          <div style="margin-top:4px;font-size:14px;color:#166534;">后台只保留第一次签到记录。</div>
         </div>
         """
 
@@ -1014,7 +1008,7 @@ def qr_checkin():
       <div class="wx-header">
         <div class="badge">工作人员扫码</div>
         <div class="wx-title">二维码核验签到</div>
-        <div class="wx-sub">活动 ID:{event_id}</div>
+        <div class="wx-sub">活动 ID: {event_id}</div>
       </div>
 
       <div class="wx-card">
@@ -1033,74 +1027,7 @@ def qr_checkin():
       </div>
 
       <div class="wx-card">
-        <h3 style="margin:0 0 8px;">工作人员提示</h3>
-        <ul style="padding-left:18px; margin:8px 0; line-height:1.8;">
-          <li>请核对姓名、手机号或邮箱是否与到场人员一致。</li>
-          <li>若页面提示“无法重复签到”，说明该二维码已被使用。</li>
-          <li>若二维码无效，请回后台使用“手动补签”或“临时访客登记”。</li>
-        </ul>
-      </div>
-    </div>
-    """
-    return page("二维码签到", body)
-
-    registrant = find_registrant_by_token(token)
-    if registrant is None:
-        body = """
-        <div class="mini-phone"><div class="wx-card"><div class="err">二维码无效或已不存在，请联系现场工作人员。</div></div></div>
-        """
-        return page("二维码签到", body)
-
-    event_id = registrant["event_id"]
-    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "")
-    ua = request.headers.get("User-Agent", "")
-    has_webull_account = registrant["has_webull_account"] or ""
-
-    ok, msg = insert_checkin(
-        event_id=event_id,
-        registrant_id=registrant["id"],
-        submitted_phone=registrant["phone"] or "",
-        submitted_email=registrant["email"] or "",
-        has_webull_account=has_webull_account,
-        checkin_method="qr",
-        status="success",
-        message="二维码扫码签到",
-        ip=ip,
-        user_agent=ua,
-    )
-
-    if ok:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("UPDATE registrants SET qr_used_at = ? WHERE id = ?", (now_str(), registrant["id"]))
-        conn.commit()
-        conn.close()
-        extra = f"""
-        <div style="margin-top:8px;font-size:14px;color:#166534;">活动:{event_id}</div>
-        <div style="margin-top:4px;font-size:14px;color:#166534;">签到方式:工作人员扫码二维码</div>
-        <div style="margin-top:4px;font-size:14px;color:#166534;">本次为首次签到，已写入后台记录</div>
-        """
-        result = success_html("二维码签到成功", f"欢迎你，<strong>{registrant['name'] or '参会者'}</strong>", extra)
-    else:
-        result = f"""
-        <div class="success-box">
-          <div class="success-icon">✅</div>
-          <div class="success-title">核验成功</div>
-          <div style="margin-top:10px;font-size:16px;color:#14532d;">欢迎你，<strong>{registrant['name'] or '参会者'}</strong></div>
-          <div style="margin-top:8px;font-size:14px;color:#166534;">该二维码此前已完成签到，本次不重复记录。</div>
-          <div style="margin-top:4px;font-size:14px;color:#166534;">后台只保留第一次签到记录。</div>
-        </div>
-        "
-
-    body = f"""
-    <div class="mini-phone">
-      <div class="wx-header">
-        <div class="badge">二维码签到</div>
-        <div class="wx-title">讲座签到</div>
-        <div class="wx-sub">活动 ID:{event_id}</div>
-      </div>
-      <div class="wx-card">
-        {result}
+        <a href="/staff/scan"><button class="wx-btn" type="button">继续扫描下一位</button></a>
       </div>
     </div>
     """
