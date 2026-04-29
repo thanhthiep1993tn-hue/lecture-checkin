@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import re
+import secrets
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -19,13 +20,29 @@ from flask import (
 )
 
 # ============================================================
-# 讲座签到系统（完整版）
-# 新增功能：
-# 1. 签到页增加：是否已经注册开户 Webull 账户
-# 2. 该结果写入后台记录与导出表
-# 3. 若名单未匹配，前台弹出“现场注册”界面
-# 4. 现场注册界面不需要活动 ID（沿用当前活动）
-# 5. 现场注册界面增加：是否已完成 Webull 注册开户
+# 讲座签到系统：二维码签到版完整 app.py
+# ============================================================
+# 功能：
+# 1. 后台上传 Excel 名单
+# 2. 普通手机/邮箱签到
+# 3. Webull 注册开户状态记录
+# 4. 未匹配用户前台现场登记
+# 5. 后台手动补签
+# 6. 后台临时访客登记 + 补签
+# 7. 每位名单用户生成唯一二维码 token
+# 8. 到场后工作人员扫码，匹配 token 后直接签到
+# 9. 防止重复扫码 / 重复签到
+# 10. 导出签到记录与二维码链接表
+#
+# requirements.txt 建议：
+# flask
+# pandas
+# openpyxl
+# gunicorn
+# qrcode[pil]
+#
+# Render Start Command：
+# gunicorn app:app
 # ============================================================
 
 try:
@@ -50,6 +67,10 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 def init_db() -> None:
     conn = get_conn()
     cur = conn.cursor()
@@ -66,20 +87,29 @@ def init_db() -> None:
             source TEXT DEFAULT 'imported',
             has_webull_account TEXT,
             webull_opened TEXT,
+            checkin_token TEXT UNIQUE,
+            qr_sent_at TEXT,
+            qr_used_at TEXT,
             raw_json TEXT,
             created_at TEXT NOT NULL
         )
         """
     )
 
+    # 兼容旧数据库结构：缺字段则自动补字段
     cur.execute("PRAGMA table_info(registrants)")
     registrant_cols = [row[1] for row in cur.fetchall()]
-    if "source" not in registrant_cols:
-        cur.execute("ALTER TABLE registrants ADD COLUMN source TEXT DEFAULT 'imported'")
-    if "has_webull_account" not in registrant_cols:
-        cur.execute("ALTER TABLE registrants ADD COLUMN has_webull_account TEXT")
-    if "webull_opened" not in registrant_cols:
-        cur.execute("ALTER TABLE registrants ADD COLUMN webull_opened TEXT")
+    migrations = {
+        "source": "ALTER TABLE registrants ADD COLUMN source TEXT DEFAULT 'imported'",
+        "has_webull_account": "ALTER TABLE registrants ADD COLUMN has_webull_account TEXT",
+        "webull_opened": "ALTER TABLE registrants ADD COLUMN webull_opened TEXT",
+        "checkin_token": "ALTER TABLE registrants ADD COLUMN checkin_token TEXT UNIQUE",
+        "qr_sent_at": "ALTER TABLE registrants ADD COLUMN qr_sent_at TEXT",
+        "qr_used_at": "ALTER TABLE registrants ADD COLUMN qr_used_at TEXT",
+    }
+    for col, sql in migrations.items():
+        if col not in registrant_cols:
+            cur.execute(sql)
 
     cur.execute(
         """
@@ -90,6 +120,7 @@ def init_db() -> None:
             submitted_phone TEXT,
             submitted_email TEXT,
             has_webull_account TEXT,
+            checkin_method TEXT DEFAULT 'form',
             status TEXT NOT NULL,
             message TEXT,
             ip TEXT,
@@ -102,8 +133,13 @@ def init_db() -> None:
 
     cur.execute("PRAGMA table_info(checkins)")
     checkin_cols = [row[1] for row in cur.fetchall()]
-    if "has_webull_account" not in checkin_cols:
-        cur.execute("ALTER TABLE checkins ADD COLUMN has_webull_account TEXT")
+    checkin_migrations = {
+        "has_webull_account": "ALTER TABLE checkins ADD COLUMN has_webull_account TEXT",
+        "checkin_method": "ALTER TABLE checkins ADD COLUMN checkin_method TEXT DEFAULT 'form'",
+    }
+    for col, sql in checkin_migrations.items():
+        if col not in checkin_cols:
+            cur.execute(sql)
 
     conn.commit()
     conn.close()
@@ -117,10 +153,6 @@ def ensure_db() -> None:
 # -----------------------------
 # 工具函数
 # -----------------------------
-def now_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
 def normalize_phone(value: object) -> str:
     if value is None:
         return ""
@@ -146,16 +178,13 @@ def normalize_yes_no(value: object) -> str:
 
 def pick_column(columns: list[str], candidates: list[str]) -> Optional[str]:
     low_map = {str(c).strip().lower(): c for c in columns}
-
     for cand in candidates:
         if cand.lower() in low_map:
             return low_map[cand.lower()]
-
     for col in columns:
         low = str(col).strip().lower()
         if any(c.lower() in low for c in candidates):
             return col
-
     return None
 
 
@@ -166,8 +195,51 @@ def make_msg_html(msg_text: str, msg_type: str = "ok") -> str:
     return f'<div class="{css}" style="margin-bottom:16px;">{msg_text}</div>'
 
 
+def get_base_url() -> str:
+    # Render / 反向代理场景下优先使用用户实际访问的 host
+    return request.host_url.rstrip("/")
+
+
+def generate_unique_token() -> str:
+    conn = get_conn()
+    cur = conn.cursor()
+    while True:
+        token = secrets.token_urlsafe(32)
+        cur.execute("SELECT id FROM registrants WHERE checkin_token = ? LIMIT 1", (token,))
+        if cur.fetchone() is None:
+            conn.close()
+            return token
+
+
+def ensure_tokens_for_event(event_id: str) -> int:
+    """为指定活动所有未生成 token 的名单用户生成唯一 token。返回新增 token 数。"""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id FROM registrants WHERE event_id = ? AND (checkin_token IS NULL OR checkin_token = '')",
+        (event_id,),
+    )
+    ids = [row["id"] for row in cur.fetchall()]
+
+    count = 0
+    for rid in ids:
+        token = secrets.token_urlsafe(32)
+        # 极小概率冲突，冲突则重试
+        while True:
+            cur.execute("SELECT id FROM registrants WHERE checkin_token = ? LIMIT 1", (token,))
+            if cur.fetchone() is None:
+                break
+            token = secrets.token_urlsafe(32)
+        cur.execute("UPDATE registrants SET checkin_token = ? WHERE id = ?", (token, rid))
+        count += 1
+
+    conn.commit()
+    conn.close()
+    return count
+
+
 # -----------------------------
-# 数据层操作
+# 数据操作
 # -----------------------------
 def import_excel_to_db(file_bytes: bytes, event_id: str) -> int:
     df = pd.read_excel(io.BytesIO(file_bytes))
@@ -200,11 +272,13 @@ def import_excel_to_db(file_bytes: bytes, event_id: str) -> int:
         if not phone and not email:
             continue
 
+        token = secrets.token_urlsafe(32)
         cur.execute(
             """
             INSERT INTO registrants
-            (event_id, name, phone, email, organization, source, has_webull_account, webull_opened, raw_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (event_id, name, phone, email, organization, source,
+             has_webull_account, webull_opened, checkin_token, raw_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event_id,
@@ -215,6 +289,7 @@ def import_excel_to_db(file_bytes: bytes, event_id: str) -> int:
                 "imported",
                 has_webull_account,
                 webull_opened,
+                token,
                 row.to_json(force_ascii=False),
                 now_str(),
             ),
@@ -229,7 +304,6 @@ def import_excel_to_db(file_bytes: bytes, event_id: str) -> int:
 def find_registrant(event_id: str, phone: str, email: str):
     conn = get_conn()
     cur = conn.cursor()
-
     row = None
     if phone:
         cur.execute(
@@ -237,14 +311,21 @@ def find_registrant(event_id: str, phone: str, email: str):
             (event_id, phone),
         )
         row = cur.fetchone()
-
     if row is None and email:
         cur.execute(
             "SELECT * FROM registrants WHERE event_id = ? AND email = ? LIMIT 1",
             (event_id, email),
         )
         row = cur.fetchone()
+    conn.close()
+    return row
 
+
+def find_registrant_by_token(token: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM registrants WHERE checkin_token = ? LIMIT 1", (token,))
+    row = cur.fetchone()
     conn.close()
     return row
 
@@ -258,14 +339,15 @@ def create_walkin_registrant(
     has_webull_account: str,
     webull_opened: str,
 ):
+    token = generate_unique_token()
     conn = get_conn()
     cur = conn.cursor()
-
     cur.execute(
         """
         INSERT INTO registrants
-        (event_id, name, phone, email, organization, source, has_webull_account, webull_opened, raw_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (event_id, name, phone, email, organization, source,
+         has_webull_account, webull_opened, checkin_token, raw_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             event_id,
@@ -276,13 +358,13 @@ def create_walkin_registrant(
             "walkin",
             has_webull_account,
             webull_opened,
+            token,
             "",
             now_str(),
         ),
     )
     registrant_id = cur.lastrowid
     conn.commit()
-
     cur.execute("SELECT * FROM registrants WHERE id = ?", (registrant_id,))
     row = cur.fetchone()
     conn.close()
@@ -295,6 +377,7 @@ def insert_checkin(
     submitted_phone: str,
     submitted_email: str,
     has_webull_account: str,
+    checkin_method: str,
     status: str,
     message: str,
     ip: str,
@@ -302,15 +385,15 @@ def insert_checkin(
 ) -> tuple[bool, str]:
     conn = get_conn()
     cur = conn.cursor()
-
     try:
         cur.execute(
             """
             INSERT INTO checkins (
                 event_id, registrant_id, submitted_phone, submitted_email,
-                has_webull_account, status, message, ip, user_agent, checked_in_at
+                has_webull_account, checkin_method, status, message,
+                ip, user_agent, checked_in_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event_id,
@@ -318,6 +401,7 @@ def insert_checkin(
                 submitted_phone,
                 submitted_email,
                 has_webull_account,
+                checkin_method,
                 status,
                 message,
                 ip,
@@ -334,7 +418,7 @@ def insert_checkin(
 
 
 # -----------------------------
-# HTML 基础模板
+# HTML
 # -----------------------------
 BASE_HTML = """
 <!doctype html>
@@ -345,17 +429,8 @@ BASE_HTML = """
 <title>{{ title }}</title>
 <style>
 :root {
-  --bg:#f5f7fb;
-  --card:#ffffff;
-  --line:#e5e7eb;
-  --text:#111827;
-  --muted:#6b7280;
-  --brand:#1677ff;
-  --brand2:#0f5ed7;
-  --ok:#16a34a;
-  --okbg:#dcfce7;
-  --err:#dc2626;
-  --errbg:#fee2e2;
+  --bg:#f5f7fb; --card:#ffffff; --line:#e5e7eb; --text:#111827; --muted:#6b7280;
+  --brand:#1677ff; --brand2:#0f5ed7; --ok:#16a34a; --okbg:#dcfce7; --err:#dc2626; --errbg:#fee2e2;
 }
 * { box-sizing:border-box; }
 body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif; }
@@ -368,9 +443,7 @@ a { color:var(--brand); text-decoration:none; }
 .grid { display:grid; gap:16px; }
 .grid-2 { grid-template-columns: 1fr 1fr; }
 @media (max-width: 860px) { .grid-2 { grid-template-columns: 1fr; } }
-input, button, select {
-  width:100%; border:1px solid #dbe3ef; border-radius:14px; padding:13px 14px; font-size:16px; background:#fff;
-}
+input, button, select { width:100%; border:1px solid #dbe3ef; border-radius:14px; padding:13px 14px; font-size:16px; background:#fff; }
 button { background:linear-gradient(135deg,var(--brand),var(--brand2)); color:#fff; border:none; font-weight:700; cursor:pointer; }
 button:hover { opacity:.95; }
 .table-wrap { overflow:auto; }
@@ -385,10 +458,7 @@ th { background:#f9fafb; position:sticky; top:0; }
 .stat .v { font-size:28px; font-weight:800; margin-top:6px; }
 .ok { background:var(--okbg); color:#166534; border:1px solid #86efac; padding:12px 14px; border-radius:14px; }
 .err { background:var(--errbg); color:#991b1b; border:1px solid #fca5a5; padding:12px 14px; border-radius:14px; }
-.mini-phone {
-  max-width:430px; margin:0 auto; min-height:760px; background:linear-gradient(180deg,#eef5ff,#f8fbff);
-  border-radius:28px; padding:18px; box-shadow:0 18px 38px rgba(0,0,0,.08);
-}
+.mini-phone { max-width:430px; margin:0 auto; min-height:760px; background:linear-gradient(180deg,#eef5ff,#f8fbff); border-radius:28px; padding:18px; box-shadow:0 18px 38px rgba(0,0,0,.08); }
 .wx-header { padding:16px 8px 18px; text-align:center; }
 .wx-title { font-size:22px; font-weight:800; }
 .wx-sub { color:var(--muted); font-size:13px; margin-top:6px; }
@@ -400,11 +470,12 @@ th { background:#f9fafb; position:sticky; top:0; }
 .radio-row label { display:flex; gap:6px; align-items:center; font-size:15px; color:var(--text); }
 .radio-row input[type="radio"] { width:auto; }
 .helper { font-size:13px; color:var(--muted); margin-top:-8px; }
+.success-box { background:#ecfdf5; border:2px solid #22c55e; border-radius:18px; padding:18px 16px; text-align:center; margin-bottom:12px; }
+.success-icon { font-size:44px; line-height:1; margin-bottom:8px; }
+.success-title { font-size:24px; font-weight:800; color:#166534; }
 </style>
 </head>
-<body>
-  <div class="page">{{ body|safe }}</div>
-</body>
+<body><div class="page">{{ body|safe }}</div></body>
 </html>
 """
 
@@ -413,8 +484,20 @@ def page(title: str, body: str):
     return render_template_string(BASE_HTML, title=title, body=body)
 
 
+def success_html(title: str, name: str = "", extra: str = "") -> str:
+    return f"""
+    <div class="success-box">
+      <div class="success-icon">✅</div>
+      <div class="success-title">{title}</div>
+      {f'<div style="margin-top:10px;font-size:16px;color:#14532d;">{name}</div>' if name else ''}
+      {extra}
+      <div style="margin-top:10px;font-size:13px;color:#15803d;">系统已记录本次签到，请勿重复提交。</div>
+    </div>
+    """
+
+
 # -----------------------------
-# 后台
+# 后台首页
 # -----------------------------
 @app.route("/")
 def root():
@@ -430,33 +513,25 @@ def admin():
     if request.method == "POST":
         event_id = request.form.get("event_id", "").strip()
         file = request.files.get("file")
-
         if not event_id:
             return redirect(url_for("admin", msg="请先填写活动 ID。", msg_type="err"))
         if not file or not file.filename:
             return redirect(url_for("admin", msg="请上传 Excel 名单。", msg_type="err"))
-
         try:
             count = import_excel_to_db(file.read(), event_id)
-            return redirect(
-                url_for(
-                    "admin",
-                    msg=f"导入成功，共导入 {count} 条名单。移动端签到链接：/m/checkin?event_id={event_id}",
-                    msg_type="ok",
-                )
-            )
+            return redirect(url_for("admin", msg=f"导入成功，共导入 {count} 条名单，并已自动生成二维码 token。", msg_type="ok"))
         except Exception as e:
             return redirect(url_for("admin", msg=f"导入失败：{e}", msg_type="err"))
 
     conn = get_conn()
     cur = conn.cursor()
-
     cur.execute(
         """
         SELECT r.event_id,
                COUNT(DISTINCT r.id) AS total_registrants,
                COUNT(DISTINCT CASE WHEN c.status='success' THEN c.registrant_id END) AS total_checked_in,
-               COUNT(DISTINCT CASE WHEN c.status='failed' THEN c.id END) AS failed_attempts
+               COUNT(DISTINCT CASE WHEN c.status='failed' THEN c.id END) AS failed_attempts,
+               COUNT(DISTINCT CASE WHEN r.checkin_token IS NOT NULL AND r.checkin_token != '' THEN r.id END) AS qr_ready
         FROM registrants r
         LEFT JOIN checkins c ON r.event_id = c.event_id
         GROUP BY r.event_id
@@ -464,14 +539,12 @@ def admin():
         """
     )
     rows = cur.fetchall()
-
     cur.execute("SELECT COUNT(*) AS c FROM registrants")
     total_reg = cur.fetchone()["c"]
     cur.execute("SELECT COUNT(*) AS c FROM checkins WHERE status='success'")
     total_success = cur.fetchone()["c"]
     cur.execute("SELECT COUNT(*) AS c FROM checkins WHERE status='failed'")
     total_failed = cur.fetchone()["c"]
-
     conn.close()
 
     table_rows = "".join(
@@ -480,13 +553,15 @@ def admin():
         f"<td>{r['total_registrants']}</td>"
         f"<td>{r['total_checked_in']}</td>"
         f"<td>{r['failed_attempts']}</td>"
+        f"<td>{r['qr_ready']}</td>"
         f"<td>"
-        f"<a href='/m/checkin?event_id={r['event_id']}'>签到页</a> | "
+        f"<a href='/m/checkin?event_id={r['event_id']}'>手填签到页</a> | "
+        f"<a href='/admin/generate_qr_tokens?event_id={r['event_id']}'>生成二维码Token</a> | "
+        f"<a href='/admin/export_qr_links?event_id={r['event_id']}'>导出二维码链接</a> | "
         f"<a href='/admin/records?event_id={r['event_id']}'>签到记录</a> | "
-        f"<a href='/admin/export?event_id={r['event_id']}'>导出</a> | "
+        f"<a href='/admin/export?event_id={r['event_id']}'>导出记录</a> | "
         f"<a href='/admin/delete?event_id={r['event_id']}' onclick=\"return confirm('确定删除该活动所有数据？');\">删除</a>"
-        f"</td>"
-        f"</tr>"
+        f"</td></tr>"
         for r in rows
     )
 
@@ -494,9 +569,8 @@ def admin():
     <div class="topbar">
       <div>
         <div class="brand">讲座签到后台</div>
-        <div class="sub">微信小程序式前台 + 后台管理界面</div>
+        <div class="sub">二维码签到 + 手填签到 + 现场补签</div>
       </div>
-      <div><a href="/m/checkin?event_id=lecture_001">打开示例签到页</a></div>
     </div>
 
     <div class="stat-grid" style="margin-bottom:16px;">
@@ -514,9 +588,9 @@ def admin():
         <form method="post" enctype="multipart/form-data" class="grid">
           <input name="event_id" placeholder="活动 ID，例如 lecture_001" required>
           <input type="file" name="file" accept=".xlsx,.xls" required>
-          <button type="submit">导入名单</button>
+          <button type="submit">导入名单并生成二维码 token</button>
         </form>
-        <p class="sub">Excel 至少应包含手机号或邮箱字段。可额外包含姓名、单位，以及 Webull 注册状态字段。</p>
+        <p class="sub">Excel 至少应包含手机号或邮箱字段。若含邮箱，可用于后续邮件发送二维码。</p>
       </div>
 
       <div class="card">
@@ -534,7 +608,6 @@ def admin():
           </div>
           <button type="submit">手动补签</button>
         </form>
-        <p class="sub">适用于现场网络不稳定、二维码失效、工作人员代为登记等场景。</p>
       </div>
     </div>
 
@@ -562,14 +635,13 @@ def admin():
         </div>
         <button type="submit">登记并补签</button>
       </form>
-      <p class="sub">若该手机号/邮箱已在名单中，系统不会重复建人，而是直接补签并更新 Webull 状态；若不在名单中，则新增为临时访客并立即签到。</p>
     </div>
 
     <div class="card" style="margin-top:16px;">
-      <h3 style="margin-top:0;">二维码使用方式</h3>
-      <p>给每场讲座固定一个链接：</p>
-      <p><code>/m/checkin?event_id=lecture_001</code></p>
-      <p>把这个链接生成二维码，现场让参会者扫码即可。</p>
+      <h3 style="margin-top:0;">二维码签到说明</h3>
+      <p>导入名单后，系统会为每位用户生成唯一二维码 token。</p>
+      <p>点击“导出二维码链接”，即可得到每位用户的专属签到链接。你可以把该链接或二维码发到用户邮箱。</p>
+      <p>现场扫码后访问 <code>/qr_checkin?token=...</code>，系统会自动完成签到。</p>
     </div>
 
     <div class="card" style="margin-top:16px;">
@@ -577,9 +649,9 @@ def admin():
       <div class="table-wrap">
         <table>
           <thead>
-            <tr><th>活动 ID</th><th>名单人数</th><th>成功签到</th><th>未匹配尝试</th><th>操作</th></tr>
+            <tr><th>活动 ID</th><th>名单人数</th><th>成功签到</th><th>未匹配尝试</th><th>二维码数</th><th>操作</th></tr>
           </thead>
-          <tbody>{table_rows or '<tr><td colspan="5">暂无活动</td></tr>'}</tbody>
+          <tbody>{table_rows or '<tr><td colspan="6">暂无活动</td></tr>'}</tbody>
         </table>
       </div>
     </div>
@@ -587,6 +659,140 @@ def admin():
     return page("讲座签到后台", body)
 
 
+# -----------------------------
+# 二维码 token 与导出
+# -----------------------------
+@app.route("/admin/generate_qr_tokens")
+def admin_generate_qr_tokens():
+    event_id = request.args.get("event_id", "").strip()
+    if not event_id:
+        return redirect(url_for("admin", msg="缺少活动 ID。", msg_type="err"))
+    count = ensure_tokens_for_event(event_id)
+    return redirect(url_for("admin", msg=f"已为活动 {event_id} 新增生成 {count} 个二维码 token。", msg_type="ok"))
+
+
+@app.route("/admin/export_qr_links")
+def admin_export_qr_links():
+    event_id = request.args.get("event_id", "").strip()
+    if not event_id:
+        return redirect(url_for("admin", msg="缺少活动 ID。", msg_type="err"))
+
+    ensure_tokens_for_event(event_id)
+    base_url = get_base_url()
+
+    conn = get_conn()
+    query = """
+        SELECT id, event_id, name, phone, email, organization, source,
+               has_webull_account, webull_opened, checkin_token
+        FROM registrants
+        WHERE event_id = ?
+        ORDER BY id
+    """
+    df = pd.read_sql_query(query, conn, params=(event_id,))
+    conn.close()
+
+    if not df.empty:
+        df["二维码签到链接"] = df["checkin_token"].apply(lambda t: f"{base_url}/qr_checkin?token={t}")
+        df["二维码图片链接"] = df["checkin_token"].apply(lambda t: f"{base_url}/qr_image?token={t}")
+
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="二维码链接")
+    buffer.seek(0)
+
+    return send_file(
+        buffer,
+        as_attachment=True,
+        download_name=f"{event_id}_二维码链接.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.route("/qr_image")
+def qr_image():
+    token = request.args.get("token", "").strip()
+    if not token:
+        return "Missing token", 400
+
+    try:
+        import qrcode
+    except ImportError:
+        return "qrcode package not installed. Please add qrcode[pil] to requirements.txt", 500
+
+    url = f"{get_base_url()}/qr_checkin?token={token}"
+    img = qrcode.make(url)
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    buffer.seek(0)
+    return send_file(buffer, mimetype="image/png")
+
+
+@app.route("/qr_checkin")
+def qr_checkin():
+    token = request.args.get("token", "").strip()
+    if not token:
+        body = """
+        <div class="mini-phone"><div class="wx-card"><div class="err">二维码无效：缺少 token。</div></div></div>
+        """
+        return page("二维码签到", body)
+
+    registrant = find_registrant_by_token(token)
+    if registrant is None:
+        body = """
+        <div class="mini-phone"><div class="wx-card"><div class="err">二维码无效或已不存在，请联系现场工作人员。</div></div></div>
+        """
+        return page("二维码签到", body)
+
+    event_id = registrant["event_id"]
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "")
+    ua = request.headers.get("User-Agent", "")
+    has_webull_account = registrant["has_webull_account"] or ""
+
+    ok, msg = insert_checkin(
+        event_id=event_id,
+        registrant_id=registrant["id"],
+        submitted_phone=registrant["phone"] or "",
+        submitted_email=registrant["email"] or "",
+        has_webull_account=has_webull_account,
+        checkin_method="qr",
+        status="success",
+        message="二维码扫码签到",
+        ip=ip,
+        user_agent=ua,
+    )
+
+    if ok:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("UPDATE registrants SET qr_used_at = ? WHERE id = ?", (now_str(), registrant["id"]))
+        conn.commit()
+        conn.close()
+        extra = f"""
+        <div style="margin-top:8px;font-size:14px;color:#166534;">活动：{event_id}</div>
+        <div style="margin-top:4px;font-size:14px;color:#166534;">签到方式：二维码扫码</div>
+        """
+        result = success_html("二维码签到成功", f"欢迎你，<strong>{registrant['name'] or '参会者'}</strong>", extra)
+    else:
+        result = f'<div class="err">{msg}</div>'
+
+    body = f"""
+    <div class="mini-phone">
+      <div class="wx-header">
+        <div class="badge">二维码签到</div>
+        <div class="wx-title">讲座签到</div>
+        <div class="wx-sub">活动 ID：{event_id}</div>
+      </div>
+      <div class="wx-card">
+        {result}
+      </div>
+    </div>
+    """
+    return page("二维码签到", body)
+
+
+# -----------------------------
+# 签到记录、导出、删除
+# -----------------------------
 @app.route("/admin/records")
 def admin_records():
     event_id = request.args.get("event_id", "").strip()
@@ -598,10 +804,10 @@ def admin_records():
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT c.checked_in_at, c.status, c.message,
+        SELECT c.checked_in_at, c.status, c.message, c.checkin_method,
                c.has_webull_account,
                r.name, r.phone, r.email, r.organization, r.source, r.webull_opened,
-               c.submitted_phone, c.submitted_email
+               r.qr_used_at, c.submitted_phone, c.submitted_email
         FROM checkins c
         LEFT JOIN registrants r ON c.registrant_id = r.id
         WHERE c.event_id = ?
@@ -616,6 +822,7 @@ def admin_records():
         f"<tr>"
         f"<td>{x['checked_in_at']}</td>"
         f"<td>{x['status']}</td>"
+        f"<td>{x['checkin_method'] or ''}</td>"
         f"<td>{x['name'] or ''}</td>"
         f"<td>{(x['organization'] or '') + ('（临时访客）' if x['source'] == 'walkin' else '')}</td>"
         f"<td>{x['phone'] or x['submitted_phone'] or ''}</td>"
@@ -633,23 +840,19 @@ def admin_records():
         <div class="brand" style="font-size:24px;">签到记录</div>
         <div class="sub">活动 ID：{event_id}</div>
       </div>
-      <div>
-        <a href="/admin">返回后台</a> | <a href="/admin/export?event_id={event_id}">导出 Excel</a>
-      </div>
+      <div><a href="/admin">返回后台</a> | <a href="/admin/export?event_id={event_id}">导出 Excel</a></div>
     </div>
-
     {msg_html}
-
     <div class="card">
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
-              <th>签到时间</th><th>状态</th><th>姓名</th><th>单位</th><th>手机号</th><th>邮箱</th>
+              <th>签到时间</th><th>状态</th><th>方式</th><th>姓名</th><th>单位</th><th>手机号</th><th>邮箱</th>
               <th>是否已有Webull账户</th><th>是否已完成Webull注册开户</th><th>说明</th>
             </tr>
           </thead>
-          <tbody>{table_rows or '<tr><td colspan="9">暂无记录</td></tr>'}</tbody>
+          <tbody>{table_rows or '<tr><td colspan="10">暂无记录</td></tr>'}</tbody>
         </table>
       </div>
     </div>
@@ -660,12 +863,12 @@ def admin_records():
 @app.route("/admin/export")
 def admin_export():
     event_id = request.args.get("event_id", "").strip()
-
     conn = get_conn()
     query = """
         SELECT c.event_id AS 活动ID,
                c.checked_in_at AS 签到时间,
                c.status AS 状态,
+               c.checkin_method AS 签到方式,
                c.message AS 说明,
                r.name AS 姓名,
                r.organization AS 单位,
@@ -675,7 +878,8 @@ def admin_export():
                c.submitted_phone AS 提交手机号,
                c.submitted_email AS 提交邮箱,
                c.has_webull_account AS 是否已有Webull账户,
-               r.webull_opened AS 是否已完成Webull注册开户
+               r.webull_opened AS 是否已完成Webull注册开户,
+               r.qr_used_at AS 二维码使用时间
         FROM checkins c
         LEFT JOIN registrants r ON c.registrant_id = r.id
         WHERE c.event_id = ?
@@ -688,7 +892,6 @@ def admin_export():
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="签到记录")
     buffer.seek(0)
-
     return send_file(
         buffer,
         as_attachment=True,
@@ -702,17 +905,18 @@ def admin_delete():
     event_id = request.args.get("event_id", "").strip()
     if not event_id:
         return redirect(url_for("admin"))
-
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("DELETE FROM checkins WHERE event_id = ?", (event_id,))
     cur.execute("DELETE FROM registrants WHERE event_id = ?", (event_id,))
     conn.commit()
     conn.close()
-
     return redirect(url_for("admin", msg=f"已删除活动：{event_id}", msg_type="ok"))
 
 
+# -----------------------------
+# 手填签到、手动补签、临时访客
+# -----------------------------
 @app.route("/admin/manual_checkin", methods=["POST"])
 def admin_manual_checkin():
     event_id = request.form.get("event_id", "").strip()
@@ -727,15 +931,8 @@ def admin_manual_checkin():
 
     registrant = find_registrant(event_id, phone, email)
     if registrant is None:
-        return redirect(
-            url_for(
-                "admin",
-                msg=f"未在活动 {event_id} 的名单中找到该手机号/邮箱，请检查活动ID或输入信息。",
-                msg_type="err",
-            )
-        )
+        return redirect(url_for("admin", msg=f"未在活动 {event_id} 的名单中找到该手机号/邮箱。", msg_type="err"))
 
-    # 同步更新名单里的 Webull 状态
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -746,22 +943,12 @@ def admin_manual_checkin():
     conn.close()
 
     ok, insert_msg = insert_checkin(
-        event_id=event_id,
-        registrant_id=registrant["id"],
-        submitted_phone=phone,
-        submitted_email=email,
-        has_webull_account=has_webull_account,
-        status="success",
-        message="后台手动补签",
-        ip="admin-manual",
-        user_agent="admin-manual",
+        event_id, registrant["id"], phone, email, has_webull_account,
+        "manual", "success", "后台手动补签", "admin-manual", "admin-manual"
     )
-
     if not ok:
         return redirect(url_for("admin_records", event_id=event_id, msg=insert_msg, msg_type="err"))
-
-    display_name = registrant["name"] or "该参会者"
-    return redirect(url_for("admin_records", event_id=event_id, msg=f"手动补签成功：{display_name}", msg_type="ok"))
+    return redirect(url_for("admin_records", event_id=event_id, msg=f"手动补签成功：{registrant['name'] or '该参会者'}", msg_type="ok"))
 
 
 @app.route("/admin/walkin_checkin", methods=["POST"])
@@ -791,54 +978,18 @@ def admin_walkin_checkin():
         )
         conn.commit()
         conn.close()
-
-        ok, insert_msg = insert_checkin(
-            event_id=event_id,
-            registrant_id=existing["id"],
-            submitted_phone=phone,
-            submitted_email=email,
-            has_webull_account=has_webull_account,
-            status="success",
-            message="后台补签（已存在名单）",
-            ip="admin-walkin",
-            user_agent="admin-walkin",
-        )
+        ok, insert_msg = insert_checkin(event_id, existing["id"], phone, email, has_webull_account, "walkin_admin", "success", "后台补签（已存在名单）", "admin-walkin", "admin-walkin")
         if not ok:
             return redirect(url_for("admin_records", event_id=event_id, msg=insert_msg, msg_type="err"))
+        return redirect(url_for("admin_records", event_id=event_id, msg=f"补签成功：{existing['name'] or name}", msg_type="ok"))
 
-        display_name = existing["name"] or name
-        return redirect(url_for("admin_records", event_id=event_id, msg=f"已在名单中找到该来宾，补签成功：{display_name}", msg_type="ok"))
-
-    walkin = create_walkin_registrant(
-        event_id=event_id,
-        name=name,
-        phone=phone,
-        email=email,
-        organization=organization,
-        has_webull_account=has_webull_account,
-        webull_opened=webull_opened,
-    )
-    ok, insert_msg = insert_checkin(
-        event_id=event_id,
-        registrant_id=walkin["id"],
-        submitted_phone=phone,
-        submitted_email=email,
-        has_webull_account=has_webull_account,
-        status="success",
-        message="临时访客现场登记并签到",
-        ip="admin-walkin",
-        user_agent="admin-walkin",
-    )
-
+    walkin = create_walkin_registrant(event_id, name, phone, email, organization, has_webull_account, webull_opened)
+    ok, insert_msg = insert_checkin(event_id, walkin["id"], phone, email, has_webull_account, "walkin_admin", "success", "临时访客现场登记并签到", "admin-walkin", "admin-walkin")
     if not ok:
         return redirect(url_for("admin_records", event_id=event_id, msg=insert_msg, msg_type="err"))
-
     return redirect(url_for("admin_records", event_id=event_id, msg=f"临时访客登记并补签成功：{name}", msg_type="ok"))
 
 
-# -----------------------------
-# 移动端签到
-# -----------------------------
 @app.route("/m/checkin", methods=["GET", "POST"])
 def mobile_checkin():
     event_id = request.args.get("event_id", "").strip() or request.form.get("event_id", "").strip()
@@ -847,12 +998,10 @@ def mobile_checkin():
 
     if request.method == "POST":
         action = request.form.get("action", "checkin").strip()
-
         if action == "checkin":
             phone = normalize_phone(request.form.get("phone", ""))
             email = normalize_email(request.form.get("email", ""))
             has_webull_account = normalize_yes_no(request.form.get("has_webull_account", ""))
-
             if not event_id:
                 result = '<div class="err">缺少活动 ID，请联系工作人员。</div>'
             elif not phone and not email:
@@ -863,56 +1012,19 @@ def mobile_checkin():
                 registrant = find_registrant(event_id, phone, email)
                 ip = request.headers.get("X-Forwarded-For", request.remote_addr or "")
                 ua = request.headers.get("User-Agent", "")
-
                 if registrant is None:
-                    insert_checkin(
-                        event_id=event_id,
-                        registrant_id=None,
-                        submitted_phone=phone,
-                        submitted_email=email,
-                        has_webull_account=has_webull_account,
-                        status="failed",
-                        message="名单未匹配",
-                        ip=ip,
-                        user_agent=ua,
-                    )
-                    result = '<div class="err">未在名单中匹配到该手机号或邮箱。你可以直接填写下方注册信息，完成现场登记。</div>'
+                    insert_checkin(event_id, None, phone, email, has_webull_account, "form", "failed", "名单未匹配", ip, ua)
+                    result = '<div class="err">未在名单中匹配到该手机号或邮箱。你可以填写下方登记信息完成现场登记。</div>'
                     show_register_form = True
                 else:
-                    # 同步更新名单中的 Webull 状态
                     conn = get_conn()
                     cur = conn.cursor()
-                    cur.execute(
-                        "UPDATE registrants SET has_webull_account = COALESCE(?, has_webull_account) WHERE id = ?",
-                        (has_webull_account or None, registrant["id"]),
-                    )
+                    cur.execute("UPDATE registrants SET has_webull_account = COALESCE(?, has_webull_account) WHERE id = ?", (has_webull_account or None, registrant["id"]))
                     conn.commit()
                     conn.close()
-
-                    ok, msg = insert_checkin(
-                        event_id=event_id,
-                        registrant_id=registrant["id"],
-                        submitted_phone=phone,
-                        submitted_email=email,
-                        has_webull_account=has_webull_account,
-                        status="success",
-                        message="签到成功",
-                        ip=ip,
-                        user_agent=ua,
-                    )
+                    ok, msg = insert_checkin(event_id, registrant["id"], phone, email, has_webull_account, "form", "success", "签到成功", ip, ua)
                     if ok:
-                        display_name = registrant["name"] or "参会者"
-                        org = registrant["organization"] or ""
-                        result = (
-                            '<div style="background:#ecfdf5;border:2px solid #22c55e;border-radius:18px;padding:18px 16px;text-align:center;margin-bottom:12px;">'
-                            '<div style="font-size:44px;line-height:1;margin-bottom:8px;">✅</div>'
-                            '<div style="font-size:24px;font-weight:800;color:#166534;">签到成功</div>'
-                            f'<div style="margin-top:10px;font-size:16px;color:#14532d;">欢迎你，<strong>{display_name}</strong></div>'
-                            f'{f"<div style=\"margin-top:6px;font-size:14px;color:#166534;\">单位：{org}</div>" if org else ""}'
-                            f'<div style="margin-top:8px;font-size:14px;color:#166534;">是否已有 Webull 账户：{has_webull_account}</div>'
-                            '<div style="margin-top:10px;font-size:13px;color:#15803d;">系统已记录本次签到，请勿重复提交。</div>'
-                            '</div>'
-                        )
+                        result = success_html("签到成功", f"欢迎你，<strong>{registrant['name'] or '参会者'}</strong>", f'<div style="margin-top:8px;font-size:14px;color:#166534;">是否已有 Webull 账户：{has_webull_account}</div>')
                     else:
                         result = f'<div class="err">{msg}</div>'
 
@@ -923,7 +1035,6 @@ def mobile_checkin():
             organization = request.form.get("organization", "").strip()
             has_webull_account = normalize_yes_no(request.form.get("has_webull_account", ""))
             webull_opened = normalize_yes_no(request.form.get("webull_opened", ""))
-
             if not event_id:
                 result = '<div class="err">缺少活动 ID，请联系工作人员。</div>'
                 show_register_form = True
@@ -937,88 +1048,34 @@ def mobile_checkin():
                 result = '<div class="err">请选择是否已完成 Webull 注册开户。</div>'
                 show_register_form = True
             else:
-                existing = find_registrant(event_id, phone, email)
                 ip = request.headers.get("X-Forwarded-For", request.remote_addr or "")
                 ua = request.headers.get("User-Agent", "")
-
+                existing = find_registrant(event_id, phone, email)
                 if existing is not None:
+                    target = existing
                     conn = get_conn()
                     cur = conn.cursor()
-                    cur.execute(
-                        "UPDATE registrants SET has_webull_account = COALESCE(?, has_webull_account), webull_opened = COALESCE(?, webull_opened), organization = COALESCE(NULLIF(?, ''), organization) WHERE id = ?",
-                        (has_webull_account or None, webull_opened or None, organization, existing["id"]),
-                    )
+                    cur.execute("UPDATE registrants SET has_webull_account = COALESCE(?, has_webull_account), webull_opened = COALESCE(?, webull_opened), organization = COALESCE(NULLIF(?, ''), organization) WHERE id = ?", (has_webull_account or None, webull_opened or None, organization, target["id"]))
                     conn.commit()
                     conn.close()
-
-                    ok, msg = insert_checkin(
-                        event_id=event_id,
-                        registrant_id=existing["id"],
-                        submitted_phone=phone,
-                        submitted_email=email,
-                        has_webull_account=has_webull_account,
-                        status="success",
-                        message="前台补登记后签到（已存在名单）",
-                        ip=ip,
-                        user_agent=ua,
-                    )
-                    if ok:
-                        display_name = existing["name"] or name
-                        result = (
-                            '<div style="background:#ecfdf5;border:2px solid #22c55e;border-radius:18px;padding:18px 16px;text-align:center;margin-bottom:12px;">'
-                            '<div style="font-size:44px;line-height:1;margin-bottom:8px;">✅</div>'
-                            '<div style="font-size:24px;font-weight:800;color:#166534;">登记并签到成功</div>'
-                            f'<div style="margin-top:10px;font-size:16px;color:#14532d;">欢迎你，<strong>{display_name}</strong></div>'
-                            f'<div style="margin-top:8px;font-size:14px;color:#166534;">是否已有 Webull 账户：{has_webull_account or ""}</div>'
-                            f'<div style="margin-top:4px;font-size:14px;color:#166534;">是否已完成 Webull 注册开户：{webull_opened or ""}</div>'
-                            '</div>'
-                        )
-                        show_register_form = False
-                    else:
-                        result = f'<div class="err">{msg}</div>'
-                        show_register_form = True
+                    message = "前台补登记后签到（已存在名单）"
                 else:
-                    walkin = create_walkin_registrant(
-                        event_id=event_id,
-                        name=name,
-                        phone=phone,
-                        email=email,
-                        organization=organization,
-                        has_webull_account=has_webull_account,
-                        webull_opened=webull_opened,
-                    )
-                    ok, msg = insert_checkin(
-                        event_id=event_id,
-                        registrant_id=walkin["id"],
-                        submitted_phone=phone,
-                        submitted_email=email,
-                        has_webull_account=has_webull_account,
-                        status="success",
-                        message="前台现场登记并签到",
-                        ip=ip,
-                        user_agent=ua,
-                    )
-                    if ok:
-                        result = (
-                            '<div style="background:#ecfdf5;border:2px solid #22c55e;border-radius:18px;padding:18px 16px;text-align:center;margin-bottom:12px;">'
-                            '<div style="font-size:44px;line-height:1;margin-bottom:8px;">✅</div>'
-                            '<div style="font-size:24px;font-weight:800;color:#166534;">登记并签到成功</div>'
-                            f'<div style="margin-top:10px;font-size:16px;color:#14532d;">欢迎你，<strong>{name}</strong></div>'
-                            f'<div style="margin-top:8px;font-size:14px;color:#166534;">是否已有 Webull 账户：{has_webull_account or ""}</div>'
-                            f'<div style="margin-top:4px;font-size:14px;color:#166534;">是否已完成 Webull 注册开户：{webull_opened or ""}</div>'
-                            '</div>'
-                        )
-                        show_register_form = False
-                    else:
-                        result = f'<div class="err">{msg}</div>'
-                        show_register_form = True
+                    target = create_walkin_registrant(event_id, name, phone, email, organization, has_webull_account, webull_opened)
+                    message = "前台现场登记并签到"
+                ok, msg = insert_checkin(event_id, target["id"], phone, email, has_webull_account, "walkin_form", "success", message, ip, ua)
+                if ok:
+                    result = success_html("登记并签到成功", f"欢迎你，<strong>{name}</strong>", f'<div style="margin-top:8px;font-size:14px;color:#166534;">是否已完成 Webull 注册开户：{webull_opened}</div>')
+                    show_register_form = False
+                else:
+                    result = f'<div class="err">{msg}</div>'
+                    show_register_form = True
 
     register_block = ""
     if show_register_form:
         register_block = f"""
         <div class="wx-card">
           <h3 style="margin:0 0 8px;">未匹配？请现场登记</h3>
-          <p class="sub" style="margin-top:0;">若你未提前报名或系统未匹配到你的信息，请填写以下内容完成现场登记。当前活动将自动沿用，无需重复填写活动 ID。</p>
+          <p class="sub" style="margin-top:0;">当前活动将自动沿用，无需填写活动 ID。</p>
           <form method="post" class="grid" style="margin-top:12px;">
             <input type="hidden" name="action" value="register_walkin">
             <input type="hidden" name="event_id" value="{event_id}">
@@ -1026,20 +1083,8 @@ def mobile_checkin():
             <input name="phone" placeholder="手机号（建议填写）">
             <input name="email" placeholder="邮箱（手机号不便时可填）">
             <input name="organization" placeholder="单位 / 公司 / 机构（可选）">
-            <div class="radio-group">
-              <div class="helper">是否已有 Webull 账户？</div>
-              <div class="radio-row">
-                <label><input type="radio" name="has_webull_account" value="是" required> 是</label>
-                <label><input type="radio" name="has_webull_account" value="否"> 否</label>
-              </div>
-            </div>
-            <div class="radio-group">
-              <div class="helper">是否已完成 Webull 注册开户？</div>
-              <div class="radio-row">
-                <label><input type="radio" name="webull_opened" value="是" required> 是</label>
-                <label><input type="radio" name="webull_opened" value="否"> 否</label>
-              </div>
-            </div>
+            <div class="radio-group"><div class="helper">是否已有 Webull 账户？</div><div class="radio-row"><label><input type="radio" name="has_webull_account" value="是" required> 是</label><label><input type="radio" name="has_webull_account" value="否"> 否</label></div></div>
+            <div class="radio-group"><div class="helper">是否已完成 Webull 注册开户？</div><div class="radio-row"><label><input type="radio" name="webull_opened" value="是" required> 是</label><label><input type="radio" name="webull_opened" value="否"> 否</label></div></div>
             <button class="wx-btn" type="submit">登记并签到</button>
           </form>
         </div>
@@ -1047,12 +1092,7 @@ def mobile_checkin():
 
     body = f"""
     <div class="mini-phone">
-      <div class="wx-header">
-        <div class="badge">扫码签到</div>
-        <div class="wx-title">讲座签到</div>
-        <div class="wx-sub">活动 ID：{event_id or '未提供'}</div>
-      </div>
-
+      <div class="wx-header"><div class="badge">扫码签到</div><div class="wx-title">讲座签到</div><div class="wx-sub">活动 ID：{event_id or '未提供'}</div></div>
       <div class="wx-card">
         <h3 style="margin:0 0 8px;">填写签到信息</h3>
         <p class="sub" style="margin-top:0;">请输入报名时填写的手机号，若手机号不便输入，也可填写邮箱。</p>
@@ -1062,28 +1102,12 @@ def mobile_checkin():
           <input type="hidden" name="event_id" value="{event_id}">
           <input name="phone" placeholder="请输入手机号">
           <input name="email" placeholder="或输入邮箱（可选）">
-          <div class="radio-group">
-            <div class="helper">您是否已经注册开户 Webull 账户？</div>
-            <div class="radio-row">
-              <label><input type="radio" name="has_webull_account" value="是" required> 是</label>
-              <label><input type="radio" name="has_webull_account" value="否"> 否</label>
-            </div>
-          </div>
+          <div class="radio-group"><div class="helper">您是否已经注册开户 Webull 账户？</div><div class="radio-row"><label><input type="radio" name="has_webull_account" value="是" required> 是</label><label><input type="radio" name="has_webull_account" value="否"> 否</label></div></div>
           <button class="wx-btn" type="submit">立即签到</button>
         </form>
       </div>
-
       {register_block}
-
-      <div class="wx-card">
-        <h3 style="margin:0 0 8px;">签到说明</h3>
-        <ul style="padding-left:18px; margin:8px 0; line-height:1.8;">
-          <li>系统优先使用手机号匹配名单。</li>
-          <li>若手机号未匹配，再使用邮箱匹配。</li>
-          <li>已签到用户不能重复签到。</li>
-          <li>若提示未匹配，可直接填写现场登记表单。</li>
-        </ul>
-      </div>
+      <div class="wx-card"><h3 style="margin:0 0 8px;">签到说明</h3><ul style="padding-left:18px; margin:8px 0; line-height:1.8;"><li>系统优先使用手机号匹配名单。</li><li>若手机号未匹配，再使用邮箱匹配。</li><li>已签到用户不能重复签到。</li><li>若提示未匹配，可直接填写现场登记表单。</li></ul></div>
     </div>
     """
     return page("讲座签到", body)
@@ -1099,35 +1123,22 @@ def api_checkin():
     phone = normalize_phone(data.get("phone", ""))
     email = normalize_email(data.get("email", ""))
     has_webull_account = normalize_yes_no(data.get("has_webull_account", ""))
-
     if not event_id:
         return jsonify({"ok": False, "message": "缺少 event_id"}), 400
     if not phone and not email:
         return jsonify({"ok": False, "message": "请填写手机号或邮箱"}), 400
     if not has_webull_account:
         return jsonify({"ok": False, "message": "请填写是否已有 Webull 账户"}), 400
-
     registrant = find_registrant(event_id, phone, email)
     ip = request.headers.get("X-Forwarded-For", request.remote_addr or "")
     ua = request.headers.get("User-Agent", "")
-
     if registrant is None:
-        insert_checkin(event_id, None, phone, email, has_webull_account, "failed", "名单未匹配", ip, ua)
+        insert_checkin(event_id, None, phone, email, has_webull_account, "api", "failed", "名单未匹配", ip, ua)
         return jsonify({"ok": False, "message": "未在名单中找到该用户，请转入现场登记"}), 404
-
-    ok, msg = insert_checkin(event_id, registrant["id"], phone, email, has_webull_account, "success", "签到成功", ip, ua)
+    ok, msg = insert_checkin(event_id, registrant["id"], phone, email, has_webull_account, "api", "success", "签到成功", ip, ua)
     if not ok:
         return jsonify({"ok": False, "message": msg}), 409
-
-    return jsonify(
-        {
-            "ok": True,
-            "message": "签到成功",
-            "name": registrant["name"],
-            "organization": registrant["organization"],
-            "has_webull_account": has_webull_account,
-        }
-    )
+    return jsonify({"ok": True, "message": "签到成功", "name": registrant["name"], "organization": registrant["organization"], "has_webull_account": has_webull_account})
 
 
 application = app
