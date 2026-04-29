@@ -269,7 +269,7 @@ Webull Event Team
     msg.set_content(plain_text)
     msg.add_alternative(html, subtype="html")
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
         server.starttls()
         server.login(SMTP_USER, SMTP_PASSWORD)
         server.send_message(msg)
