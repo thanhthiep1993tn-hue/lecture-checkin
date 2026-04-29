@@ -729,12 +729,124 @@ def qr_image():
 
 @app.route("/qr_checkin")
 def qr_checkin():
+    """工作人员扫描参会者个人二维码后的核验签到页。
+
+    这个页面不是给用户自己填信息用的，而是给现场工作人员扫码后确认：
+    - token 是否有效
+    - 参会者是谁
+    - 是否已经签到过
+    - 本次扫码是否成功写入后台
+    """
     token = request.args.get("token", "").strip()
+    checked_time = now_str()
+
     if not token:
         body = """
-        <div class="mini-phone"><div class="wx-card"><div class="err">二维码无效：缺少 token。</div></div></div>
+        <div class="mini-phone">
+          <div class="wx-header">
+            <div class="badge">工作人员扫码</div>
+            <div class="wx-title">二维码核验</div>
+          </div>
+          <div class="wx-card">
+            <div class="err">二维码无效：缺少 token。请让参会者重新出示二维码，或联系后台工作人员。</div>
+          </div>
+        </div>
         """
         return page("二维码签到", body)
+
+    registrant = find_registrant_by_token(token)
+    if registrant is None:
+        body = """
+        <div class="mini-phone">
+          <div class="wx-header">
+            <div class="badge">工作人员扫码</div>
+            <div class="wx-title">二维码核验</div>
+          </div>
+          <div class="wx-card">
+            <div class="err">二维码无效或已不存在。请核对该二维码是否来自本系统，或改用后台手动补签。</div>
+          </div>
+        </div>
+        """
+        return page("二维码签到", body)
+
+    event_id = registrant["event_id"]
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "")
+    ua = request.headers.get("User-Agent", "")
+    has_webull_account = registrant["has_webull_account"] or ""
+
+    ok, msg = insert_checkin(
+        event_id=event_id,
+        registrant_id=registrant["id"],
+        submitted_phone=registrant["phone"] or "",
+        submitted_email=registrant["email"] or "",
+        has_webull_account=has_webull_account,
+        checkin_method="qr_staff_scan",
+        status="success",
+        message="工作人员扫码二维码签到",
+        ip=ip,
+        user_agent=ua,
+    )
+
+    if ok:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("UPDATE registrants SET qr_used_at = ? WHERE id = ?", (checked_time, registrant["id"]))
+        conn.commit()
+        conn.close()
+
+        result = f"""
+        <div class="success-box">
+          <div class="success-icon">✅</div>
+          <div class="success-title">签到成功</div>
+          <div style="margin-top:12px;font-size:17px;color:#14532d;">请确认参会者信息</div>
+        </div>
+        """
+    else:
+        # 这里通常表示该 token 对应用户已经签到过
+        result = f"""
+        <div class="err" style="text-align:center;">
+          <div style="font-size:38px;line-height:1;margin-bottom:8px;">⚠️</div>
+          <div style="font-size:22px;font-weight:800;">无法重复签到</div>
+          <div style="margin-top:8px;">{msg}</div>
+        </div>
+        """
+
+    source_label = "临时访客" if registrant["source"] == "walkin" else "预登记名单"
+
+    body = f"""
+    <div class="mini-phone">
+      <div class="wx-header">
+        <div class="badge">工作人员扫码</div>
+        <div class="wx-title">二维码核验签到</div>
+        <div class="wx-sub">活动 ID：{event_id}</div>
+      </div>
+
+      <div class="wx-card">
+        {result}
+        <table style="width:100%;border-collapse:collapse;margin-top:14px;font-size:14px;">
+          <tr><th style="text-align:left;padding:10px;border-bottom:1px solid #e5e7eb;">姓名</th><td style="padding:10px;border-bottom:1px solid #e5e7eb;">{registrant['name'] or ''}</td></tr>
+          <tr><th style="text-align:left;padding:10px;border-bottom:1px solid #e5e7eb;">手机号</th><td style="padding:10px;border-bottom:1px solid #e5e7eb;">{registrant['phone'] or ''}</td></tr>
+          <tr><th style="text-align:left;padding:10px;border-bottom:1px solid #e5e7eb;">邮箱</th><td style="padding:10px;border-bottom:1px solid #e5e7eb;">{registrant['email'] or ''}</td></tr>
+          <tr><th style="text-align:left;padding:10px;border-bottom:1px solid #e5e7eb;">单位</th><td style="padding:10px;border-bottom:1px solid #e5e7eb;">{registrant['organization'] or ''}</td></tr>
+          <tr><th style="text-align:left;padding:10px;border-bottom:1px solid #e5e7eb;">来源</th><td style="padding:10px;border-bottom:1px solid #e5e7eb;">{source_label}</td></tr>
+          <tr><th style="text-align:left;padding:10px;border-bottom:1px solid #e5e7eb;">是否已有 Webull 账户</th><td style="padding:10px;border-bottom:1px solid #e5e7eb;">{has_webull_account or ''}</td></tr>
+          <tr><th style="text-align:left;padding:10px;border-bottom:1px solid #e5e7eb;">是否完成开户</th><td style="padding:10px;border-bottom:1px solid #e5e7eb;">{registrant['webull_opened'] or ''}</td></tr>
+          <tr><th style="text-align:left;padding:10px;border-bottom:1px solid #e5e7eb;">扫码时间</th><td style="padding:10px;border-bottom:1px solid #e5e7eb;">{checked_time}</td></tr>
+          <tr><th style="text-align:left;padding:10px;border-bottom:1px solid #e5e7eb;">签到方式</th><td style="padding:10px;border-bottom:1px solid #e5e7eb;">工作人员扫码二维码</td></tr>
+        </table>
+      </div>
+
+      <div class="wx-card">
+        <h3 style="margin:0 0 8px;">工作人员提示</h3>
+        <ul style="padding-left:18px; margin:8px 0; line-height:1.8;">
+          <li>请核对姓名、手机号或邮箱是否与到场人员一致。</li>
+          <li>若页面提示“无法重复签到”，说明该二维码已被使用。</li>
+          <li>若二维码无效，请回后台使用“手动补签”或“临时访客登记”。</li>
+        </ul>
+      </div>
+    </div>
+    """
+    return page("二维码签到", body)
 
     registrant = find_registrant_by_token(token)
     if registrant is None:
