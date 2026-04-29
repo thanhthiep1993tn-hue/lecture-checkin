@@ -1077,11 +1077,20 @@ def qr_checkin():
         conn.close()
         extra = f"""
         <div style="margin-top:8px;font-size:14px;color:#166534;">活动：{event_id}</div>
-        <div style="margin-top:4px;font-size:14px;color:#166534;">签到方式：二维码扫码</div>
+        <div style="margin-top:4px;font-size:14px;color:#166534;">签到方式：工作人员扫码二维码</div>
+        <div style="margin-top:4px;font-size:14px;color:#166534;">本次为首次签到，已写入后台记录</div>
         """
         result = success_html("二维码签到成功", f"欢迎你，<strong>{registrant['name'] or '参会者'}</strong>", extra)
     else:
-        result = f'<div class="err">{msg}</div>'
+        result = f"""
+        <div class="success-box">
+          <div class="success-icon">✅</div>
+          <div class="success-title">核验成功</div>
+          <div style="margin-top:10px;font-size:16px;color:#14532d;">欢迎你，<strong>{registrant['name'] or '参会者'}</strong></div>
+          <div style="margin-top:8px;font-size:14px;color:#166534;">该二维码此前已完成签到，本次不重复记录。</div>
+          <div style="margin-top:4px;font-size:14px;color:#166534;">后台只保留第一次签到记录。</div>
+        </div>
+        "
 
     body = f"""
     <div class="mini-phone">
