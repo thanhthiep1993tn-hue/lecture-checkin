@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import os
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+RESEND_FROM = "Webull Event <onboarding@resend.dev>"
 import re
 import secrets
 import sqlite3
