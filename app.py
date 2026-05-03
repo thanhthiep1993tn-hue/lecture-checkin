@@ -5,7 +5,6 @@ import os
 import re
 import secrets
 import sqlite3
-import smtplib
 from datetime import datetime
 from email.message import EmailMessage
 from email.utils import formataddr
@@ -72,11 +71,6 @@ STAFF_SCAN_PASSWORD = "webull-staff-2026"
 # -----------------------------
 # For safety, do not hard-code your Gmail App Password here.
 # Set EMAIL_PASS in Render -> Settings -> Environment.
-SMTP_HOST = "smtp.gmail.com"
-SMTP_PORT = 587
-SMTP_USER = "blakezhong23@gmail.com"
-SMTP_PASSWORD = os.environ.get("EMAIL_PASS")
-FROM_NAME = "Webull Event Team"
 
 
 # -----------------------------
@@ -222,58 +216,42 @@ def get_base_url() -> str:
 
 
 def send_qr_email(to_email: str, name: str, event_id: str, qr_link: str, qr_image_url: str) -> None:
-    """Send the personal QR check-in email to one attendee."""
-    if not SMTP_PASSWORD:
-        raise RuntimeError("EMAIL_PASS is not set in environment variables.")
+    if not RESEND_API_KEY:
+        raise RuntimeError("RESEND_API_KEY is not set in Render environment variables.")
 
-    msg = EmailMessage()
-    msg["Subject"] = f"Your Check-in QR Code for {event_id}"
-    msg["From"] = formataddr((FROM_NAME, SMTP_USER))
-    msg["To"] = to_email
+    resend.api_key = RESEND_API_KEY
 
-    plain_text = f"""Dear {name or "Guest"},
-
-Thank you for registering.
-
-Please present your personal QR code when you arrive at the venue. Our staff will scan it to complete your check-in.
-
-Check-in link:
-{qr_link}
-
-Best regards,
-Webull Event Team
-"""
+    subject = f"Your Check-in QR Code for {event_id}"
 
     html = f"""
     <html>
-      <body style="font-family: Arial, sans-serif; line-height: 1.6;">
+      <body>
         <p>Dear {name or "Guest"},</p>
 
-        <p>Thank you for registering.</p>
+        <p>Thank you for registering for our event.</p>
 
-        <p>Please present this QR code when you arrive at the venue. Our staff will scan it to complete your check-in.</p>
+        <p>Please present this QR code when you arrive. Our staff will scan it to complete your check-in.</p>
 
         <p>
           <img src="{qr_image_url}" alt="Check-in QR Code" style="width:220px;height:220px;" />
         </p>
 
-        <p>If the QR code image does not display, please open this link:</p>
+        <p>If the QR code does not display, please open this link:</p>
         <p><a href="{qr_link}">{qr_link}</a></p>
-
-        <p>Event ID: {event_id}</p>
 
         <p>Best regards,<br>Webull Event Team</p>
       </body>
     </html>
     """
 
-    msg.set_content(plain_text)
-    msg.add_alternative(html, subtype="html")
+    params = {
+        "from": RESEND_FROM,
+        "to": [to_email],
+        "subject": subject,
+        "html": html,
+    }
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASSWORD)
-        server.send_message(msg)
+    resend.Emails.send(params)
 
 
 def generate_unique_token() -> str:
