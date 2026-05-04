@@ -217,43 +217,35 @@ def get_base_url() -> str:
     return request.host_url.rstrip("/")
 
 
-def send_qr_email(to_email: str, name: str, event_id: str, qr_link: str, qr_image_url: str) -> None:
-    if not RESEND_API_KEY:
-        raise RuntimeError("RESEND_API_KEY is not set in Render environment variables.")
+import requests
+import os
 
-    resend.api_key = RESEND_API_KEY
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 
-    subject = f"Your Check-in QR Code for {event_id}"
+def send_qr_email(to_email, name, event_id, qr_link, qr_img):
+    url = "https://api.resend.com/emails"
 
-    html = f"""
-    <html>
-      <body>
-        <p>Dear {name or "Guest"},</p>
-
-        <p>Thank you for registering for our event.</p>
-
-        <p>Please present this QR code when you arrive. Our staff will scan it to complete your check-in.</p>
-
-        <p>
-          <img src="{qr_image_url}" alt="Check-in QR Code" style="width:220px;height:220px;" />
-        </p>
-
-        <p>If the QR code does not display, please open this link:</p>
-        <p><a href="{qr_link}">{qr_link}</a></p>
-
-        <p>Best regards,<br>Webull Event Team</p>
-      </body>
-    </html>
-    """
-
-    params = {
-        "from": RESEND_FROM,
-        "to": [to_email],
-        "subject": subject,
-        "html": html,
+    headers = {
+        "Authorization": f"Bearer {RESEND_API_KEY}",
+        "Content-Type": "application/json"
     }
 
-    resend.Emails.send(params)
+    data = {
+        "from": "noreply@eventflowpro.fun",
+        "to": [to_email],
+        "subject": f"签到二维码 - 活动 {event_id}",
+        "html": f"""
+        <h2>你好 {name}</h2>
+        <p>这是你的签到二维码：</p>
+        <img src="{qr_img}" width="200"/>
+        <p>或者点击链接签到：</p>
+        <a href="{qr_link}">{qr_link}</a>
+        """
+    }
+
+    response = requests.post(url, json=data, headers=headers)
+
+    print("Resend response:", response.text)
 
 
 def generate_unique_token() -> str:
