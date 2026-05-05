@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 import os
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
-RESEND_FROM = "Webull Event <onboarding@resend.dev>"
+RESEND_FROM = "Webull Event <noreply@eventflowpro.fun>"
 import re
 import secrets
 import sqlite3
@@ -12,7 +12,9 @@ from email.message import EmailMessage
 from email.utils import formataddr
 from pathlib import Path
 from typing import Optional
+from functools import wraps
 import resend
+from werkzeug.security import generate_password_hash, check_password_hash
 
 import pandas as pd
 from flask import (
@@ -62,7 +64,8 @@ DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "checkin_mini.db"
 
 app = Flask(__name__)
-app.secret_key = "replace-this-with-a-random-secret-key"
+app.secret_key = os.environ.get("APP_SECRET_KEY", "replace-this-with-a-random-secret-key")
+ADMIN_REGISTER_CODE = os.environ.get("ADMIN_REGISTER_CODE")
 
 # 工作人员扫码口令:上线前请改成你们内部口令。
 # 之后也可以改成环境变量:os.environ.get("STAFF_SCAN_PASSWORD")
@@ -158,6 +161,17 @@ def init_db() -> None:
         if col not in checkin_cols:
             cur.execute(sql)
 
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS admin_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -217,6 +231,26 @@ def get_base_url() -> str:
     return request.host_url.rstrip("/")
 
 
+def is_safe_next_url(next_url: str) -> bool:
+    if not next_url:
+        return False
+    return next_url.startswith("/") and not next_url.startswith("//")
+
+
+def is_admin_logged_in() -> bool:
+    return session.get("admin_logged_in") is True
+
+
+def admin_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not is_admin_logged_in():
+            next_url = request.full_path if request.query_string else request.path
+            return redirect(url_for("admin_login", next=next_url))
+        return func(*args, **kwargs)
+    return wrapper
+
+
 import requests
 import os
 
@@ -230,22 +264,27 @@ def send_qr_email(to_email, name, event_id, qr_link, qr_img):
         "Content-Type": "application/json"
     }
 
+    if not RESEND_API_KEY:
+        raise RuntimeError("RESEND_API_KEY is not set in environment variables.")
+
     data = {
-        "from": "noreply@eventflowpro.fun",
+        "from": RESEND_FROM,
         "to": [to_email],
         "subject": f"签到二维码 - 活动 {event_id}",
         "html": f"""
-        <h2>你好 {name}</h2>
-        <p>这是你的签到二维码：</p>
-        <img src="{qr_img}" width="200"/>
-        <p>或者点击链接签到：</p>
-        <a href="{qr_link}">{qr_link}</a>
+        <h2>你好 {name or 'Guest'}</h2>
+        <p>感谢报名参加本次活动。请在到场时向工作人员出示下方二维码，工作人员扫码后即可完成签到。</p>
+        <p><img src="{qr_img}" width="220" style="width:220px;height:220px;"/></p>
+        <p>如果二维码无法显示，也可以打开以下链接：</p>
+        <p><a href="{qr_link}">{qr_link}</a></p>
+        <p>Webull Event Team</p>
         """
     }
 
-    response = requests.post(url, json=data, headers=headers)
-
-    print("Resend response:", response.text)
+    response = requests.post(url, json=data, headers=headers, timeout=20)
+    print("Resend response:", response.status_code, response.text)
+    if response.status_code >= 400:
+        raise RuntimeError(f"Resend error {response.status_code}: {response.text}")
 
 
 def generate_unique_token() -> str:
@@ -552,7 +591,121 @@ def root():
     return redirect(url_for("admin"))
 
 
+@app.route("/admin/register", methods=["GET", "POST"])
+def admin_register():
+    msg = ""
+
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "").strip()
+        register_code = request.form.get("register_code", "").strip()
+
+        if not username or not password:
+            msg = '<div class="err">请填写用户名和密码。</div>'
+        elif len(password) < 6:
+            msg = '<div class="err">密码至少需要 6 位。</div>'
+        elif not ADMIN_REGISTER_CODE:
+            msg = '<div class="err">系统尚未设置 ADMIN_REGISTER_CODE。请先在 Render 的 Environment 中添加管理员注册码。</div>'
+        elif register_code != ADMIN_REGISTER_CODE:
+            msg = '<div class="err">管理员注册码错误。</div>'
+        else:
+            try:
+                conn = get_conn()
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO admin_users (username, password_hash, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (username, generate_password_hash(password), now_str()),
+                )
+                conn.commit()
+                conn.close()
+                return redirect(url_for("admin_login", msg="注册成功，请登录。"))
+            except sqlite3.IntegrityError:
+                msg = '<div class="err">该用户名已经存在，请换一个用户名。</div>'
+
+    body = f"""
+    <div class="mini-phone">
+      <div class="wx-header">
+        <div class="badge">后台管理</div>
+        <div class="wx-title">注册管理员账号</div>
+        <div class="wx-sub">注册后才能进入讲座签到后台</div>
+      </div>
+      <div class="wx-card">
+        {msg}
+        <form method="post" class="grid">
+          <input name="username" placeholder="管理员用户名" required>
+          <input name="password" type="password" placeholder="管理员密码，至少 6 位" required>
+          <input name="register_code" type="password" placeholder="管理员注册码" required>
+          <button class="wx-btn" type="submit">注册管理员</button>
+        </form>
+        <p class="sub" style="margin-top:14px;">已有账号？<a href="/admin/login">去登录</a></p>
+      </div>
+    </div>
+    """
+    return page("注册管理员", body)
+
+
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    msg_text = request.args.get("msg", "").strip()
+    msg = f'<div class="ok">{msg_text}</div>' if msg_text else ""
+    next_url = request.args.get("next", "/admin").strip() or "/admin"
+    if not is_safe_next_url(next_url):
+        next_url = "/admin"
+
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "").strip()
+        next_url = request.form.get("next", "/admin").strip() or "/admin"
+        if not is_safe_next_url(next_url):
+            next_url = "/admin"
+
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM admin_users WHERE username = ? LIMIT 1", (username,))
+        user = cur.fetchone()
+        conn.close()
+
+        if not user or not check_password_hash(user["password_hash"], password):
+            msg = '<div class="err">用户名或密码错误。</div>'
+        else:
+            session["admin_logged_in"] = True
+            session["admin_username"] = username
+            return redirect(next_url)
+
+    body = f"""
+    <div class="mini-phone">
+      <div class="wx-header">
+        <div class="badge">后台管理</div>
+        <div class="wx-title">管理员登录</div>
+        <div class="wx-sub">登录后进入讲座签到后台</div>
+      </div>
+      <div class="wx-card">
+        {msg}
+        <form method="post" class="grid">
+          <input type="hidden" name="next" value="{next_url}">
+          <input name="username" placeholder="管理员用户名" required>
+          <input name="password" type="password" placeholder="管理员密码" required>
+          <button class="wx-btn" type="submit">登录</button>
+        </form>
+        <p class="sub" style="margin-top:14px;">还没有管理员账号？<a href="/admin/register">注册管理员</a></p>
+      </div>
+    </div>
+    """
+    return page("管理员登录", body)
+
+
+@app.route("/admin/logout")
+def admin_logout():
+    session.pop("admin_logged_in", None)
+    session.pop("admin_username", None)
+    return redirect(url_for("admin_login", msg="已退出登录。"))
+
+
 @app.route("/admin", methods=["GET", "POST"])
+@admin_required
 def admin():
     msg_text = request.args.get("msg", "").strip()
     msg_type = request.args.get("msg_type", "ok").strip()
@@ -619,6 +772,11 @@ def admin():
       <div>
         <div class="brand">讲座签到后台</div>
         <div class="sub">二维码签到 + 手填签到 + 现场补签</div>
+      </div>
+      <div>
+        <span class="sub">当前管理员:{session.get("admin_username", "")}</span>
+        | <a href="/staff/scan" style="font-weight:800;">现场扫码模式</a>
+        | <a href="/admin/logout">退出登录</a>
       </div>
     </div>
 
@@ -710,6 +868,7 @@ def admin():
 
 
 @app.route("/admin/send_one_email")
+@admin_required
 def send_one_email():
     rid = request.args.get("id")
 
@@ -924,6 +1083,7 @@ def staff_scan():
 # 二维码 token 与导出
 # -----------------------------
 @app.route("/admin/generate_qr_tokens")
+@admin_required
 def admin_generate_qr_tokens():
     event_id = request.args.get("event_id", "").strip()
     if not event_id:
@@ -933,6 +1093,7 @@ def admin_generate_qr_tokens():
 
 
 @app.route("/admin/export_qr_links")
+@admin_required
 def admin_export_qr_links():
     event_id = request.args.get("event_id", "").strip()
     if not event_id:
@@ -971,6 +1132,7 @@ def admin_export_qr_links():
 
 
 @app.route("/admin/send_qr_emails")
+@admin_required
 def admin_send_qr_emails():
     event_id = request.args.get("event_id", "").strip()
     if not event_id:
@@ -1196,6 +1358,7 @@ def qr_checkin():
 # 签到记录、导出、删除
 # -----------------------------
 @app.route("/admin/records")
+@admin_required
 def admin_records():
     event_id = request.args.get("event_id", "").strip()
     msg_text = request.args.get("msg", "").strip()
@@ -1299,6 +1462,7 @@ def admin_records():
 
 
 @app.route("/admin/export")
+@admin_required
 def admin_export():
     event_id = request.args.get("event_id", "").strip()
     conn = get_conn()
@@ -1339,6 +1503,7 @@ def admin_export():
 
 
 @app.route("/admin/delete")
+@admin_required
 def admin_delete():
     event_id = request.args.get("event_id", "").strip()
     if not event_id:
@@ -1356,6 +1521,7 @@ def admin_delete():
 # 手填签到、手动补签、临时访客
 # -----------------------------
 @app.route("/admin/manual_checkin", methods=["POST"])
+@admin_required
 def admin_manual_checkin():
     event_id = request.form.get("event_id", "").strip()
     phone = normalize_phone(request.form.get("phone", ""))
@@ -1390,6 +1556,7 @@ def admin_manual_checkin():
 
 
 @app.route("/admin/walkin_checkin", methods=["POST"])
+@admin_required
 def admin_walkin_checkin():
     event_id = request.form.get("event_id", "").strip()
     name = request.form.get("name", "").strip()
